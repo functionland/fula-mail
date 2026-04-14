@@ -195,6 +195,33 @@ impl Database {
         Ok(())
     }
 
+    pub async fn list_pending_for_peer(&self, peer_id: &str) -> Result<Vec<PendingMailRecord>> {
+        let records = sqlx::query_as::<_, PendingMailRecord>(
+            "SELECT q.id, q.message_id, q.sender, q.subject, q.raw_size, q.created_at
+             FROM mail_inbound_queue q
+             JOIN mail_addresses a ON a.id = q.address_id
+             WHERE a.owner_peer_id = $1 AND q.status = 'pending'
+             ORDER BY q.created_at DESC"
+        )
+        .bind(peer_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    pub async fn get_queue_entry(&self, queue_id: Uuid) -> Result<Option<QueueEntryRecord>> {
+        let record = sqlx::query_as::<_, QueueEntryRecord>(
+            "SELECT id, address_id, message_id, storage_path, status
+             FROM mail_inbound_queue WHERE id = $1"
+        )
+        .bind(queue_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
     pub async fn get_expired_pending(&self) -> Result<Vec<InboundQueueRecord>> {
         let records = sqlx::query_as::<_, InboundQueueRecord>(
             "SELECT q.id, q.address_id, q.message_id, q.storage_path, a.owner_peer_id
@@ -281,6 +308,25 @@ pub struct AddressRecord {
     pub dkim_private_key: String,
     pub dkim_selector: String,
     pub domain_status: String,
+}
+
+#[derive(sqlx::FromRow, Debug)]
+pub struct PendingMailRecord {
+    pub id: Uuid,
+    pub message_id: String,
+    pub sender: String,
+    pub subject: Option<String>,
+    pub raw_size: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(sqlx::FromRow, Debug)]
+pub struct QueueEntryRecord {
+    pub id: Uuid,
+    pub address_id: Uuid,
+    pub message_id: String,
+    pub storage_path: String,
+    pub status: String,
 }
 
 #[derive(sqlx::FromRow, Debug)]

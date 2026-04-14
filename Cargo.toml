@@ -52,6 +52,12 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"] }
 # Auth (JWT - same flow as FxFiles)
 jsonwebtoken = "9"
 
+# Embedded SMTP server (inbound)
+mailin-embedded = "0.8"
+
+# SMTP client (outbound relay)
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "dkim", "builder", "smtp-transport"] }
+
 # Utilities
 base64 = "0.22"
 hex = "0.4"

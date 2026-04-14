@@ -170,27 +170,73 @@ pub async fn create_address(
 }
 
 // ---- Path A: client pickup ----
+// FxMail authenticates with JWT (same as FxFiles), fetches raw mail,
+// encrypts locally with own key, stores via S3, then ACKs.
 
 pub async fn list_pending_mail(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    // TODO: extract user identity from JWT bearer token
+    // For now, require peer_id as query param for development
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    // TODO: authenticate via JWT, list pending inbound for this user
-    Ok(Json(serde_json::json!({ "pending": [] })))
+    let peer_id = params.get("peer_id")
+        .ok_or(MailError::Unauthorized)?;
+
+    let pending = state.db.list_pending_for_peer(peer_id).await
+        .map_err(|e| MailError::Internal(e))?;
+
+    let items: Vec<serde_json::Value> = pending.iter().map(|p| {
+        serde_json::json!({
+            "queue_id": p.id,
+            "message_id": p.message_id,
+            "sender": p.sender,
+            "subject": p.subject,
+            "size": p.raw_size,
+            "received_at": p.created_at,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({ "pending": items })))
 }
 
 pub async fn get_raw_mail(
-    State(_state): State<Arc<AppState>>,
-    Path(_queue_id): Path<Uuid>,
-) -> Result<Vec<u8>, MailError> {
-    // TODO: serve raw message bytes for client-side encryption
-    Err(MailError::QueueNotFound("not implemented".into()))
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<Uuid>,
+) -> Result<axum::response::Response, MailError> {
+    let entry = state.db.get_queue_entry(queue_id).await
+        .map_err(|e| MailError::Internal(e))?
+        .ok_or_else(|| MailError::QueueNotFound(queue_id.to_string()))?;
+
+    if entry.status != "pending" {
+        return Err(MailError::QueueNotFound(format!("Entry {} is not pending", queue_id)));
+    }
+
+    let data = tokio::fs::read(&entry.storage_path).await
+        .map_err(|e| MailError::Internal(anyhow::anyhow!("Cannot read temp file: {}", e)))?;
+
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", "message/rfc822")
+        .header("X-Queue-Id", queue_id.to_string())
+        .body(axum::body::Body::from(data))
+        .unwrap())
 }
 
 pub async fn ack_mail_pickup(
-    State(_state): State<Arc<AppState>>,
-    Path(_queue_id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<Uuid>,
 ) -> Result<StatusCode, MailError> {
-    // TODO: mark as picked up, delete temp file
+    let entry = state.db.get_queue_entry(queue_id).await
+        .map_err(|e| MailError::Internal(e))?
+        .ok_or_else(|| MailError::QueueNotFound(queue_id.to_string()))?;
+
+    // Mark as picked up
+    state.db.mark_picked_up(queue_id).await
+        .map_err(|e| MailError::Internal(e))?;
+
+    // Delete temp file
+    let _ = tokio::fs::remove_file(&entry.storage_path).await;
+
+    tracing::info!("Path A: client picked up queue_id={}", queue_id);
     Ok(StatusCode::OK)
 }
 
@@ -229,9 +275,15 @@ pub struct OutboundRequest {
 }
 
 pub async fn submit_outbound(
-    State(_state): State<Arc<AppState>>,
-    Json(_req): Json<OutboundRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OutboundRequest>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    // TODO: authenticate via JWT, DKIM sign, SMTP relay
-    Ok(Json(serde_json::json!({ "status": "queued" })))
+    // TODO: authenticate via JWT (same as FxFiles)
+    let message_id = crate::outbound::send_outbound(&state.config, &state.db, &req).await
+        .map_err(|e| MailError::Internal(e))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "sent",
+        "message_id": message_id,
+    })))
 }
