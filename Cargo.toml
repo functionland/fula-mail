@@ -1,0 +1,69 @@
+[package]
+name = "fula-mail"
+version = "0.1.0"
+edition = "2021"
+description = "Fula Mail - Decentralized email gateway with SMTP, IMAP/JMAP support"
+authors = ["Functionland"]
+license = "MIT"
+
+[dependencies]
+# Stalwart SMTP/IMAP/JMAP integration
+mail-parser = "0.9"
+mail-builder = "0.3"
+mail-auth = "0.4"
+
+# Web framework (same as fula-gateway)
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = { version = "1.5", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+
+# Encryption (fula-client compatible: Ed25519 -> X25519, NaCl box)
+crypto_box = { version = "0.9", features = ["seal"] }
+curve25519-dalek = "4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+
+# Hashing (same as fula-gateway)
+blake3 = "1.5"
+sha2 = "0.10"
+
+# Database (shared PostgreSQL)
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
+
+# DNS verification
+trust-dns-resolver = "0.23"
+
+# DKIM key generation
+rsa = { version = "0.9", features = ["pkcs5", "pem"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client (for pinning service integration)
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"] }
+
+# Auth (JWT - same flow as FxFiles)
+jsonwebtoken = "9"
+
+# Utilities
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+bs58 = "0.5"
+
+[[bin]]
+name = "fula-mail"
+path = "src/main.rs"

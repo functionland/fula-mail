@@ -1,0 +1,78 @@
+# Fula Mail - Decentralized Email Gateway
+# Connects to the shared PostgreSQL instance used by pinning-service and fula-api
+#
+# Usage: docker-compose up -d
+
+version: "3.8"
+
+services:
+  # ============================================
+  # Fula Mail Gateway
+  # ============================================
+  fula-mail:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fula-mail
+    restart: unless-stopped
+    ports:
+      - "25:25"       # SMTP (inbound)
+      - "587:587"     # Submission (outbound, STARTTLS)
+      - "993:993"     # IMAP (standard clients)
+      - "8080:8080"   # HTTP API (management, JMAP, Path A pickup)
+    env_file:
+      - .env
+    volumes:
+      - mail-data:/var/lib/fula-mail
+      - ./migrations:/app/migrations:ro
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - mail-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ============================================
+  # PostgreSQL (shared with pinning-service/fula-api)
+  # ============================================
+  # NOTE: In production, this service is already running.
+  # This definition is for local development only.
+  # In production, set POSTGRES_HOST to the existing container.
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-pinning
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pinning_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-in-production}
+      POSTGRES_DB: ${POSTGRES_DB:-pinning_service}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - mail-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pinning_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - dev
+
+networks:
+  mail-network:
+    driver: bridge
+
+volumes:
+  mail-data:
+  postgres-data:
