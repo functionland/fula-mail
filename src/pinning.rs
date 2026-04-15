@@ -77,7 +77,7 @@ impl PinningClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::warn!("Pin request failed ({}): {} - CID: {}", status, body, cid);
+            anyhow::bail!("Pin request failed ({}): {} - CID: {}", status, body, cid);
         }
 
         Ok(())

@@ -2,19 +2,33 @@
 
 use std::sync::Arc;
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{dns, error::MailError, server::AppState};
+use crate::{auth::AuthenticatedUser, dns, error::MailError, server::AppState};
 
 // ---- Health ----
 
-pub async fn health() -> StatusCode {
-    StatusCode::OK
+/// Deep readiness probe: checks DB connectivity.
+/// Returns 200 if healthy, 503 if any dependency is down.
+pub async fn health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Check DB connectivity
+    let db_ok = state.db.health_check().await;
+
+    if db_ok {
+        Ok(Json(serde_json::json!({
+            "status": "ok",
+            "db": "connected",
+        })))
+    } else {
+        Err(StatusCode::SERVICE_UNAVAILABLE)
+    }
 }
 
 // ---- Domain management ----
@@ -22,7 +36,6 @@ pub async fn health() -> StatusCode {
 #[derive(Deserialize)]
 pub struct CreateDomainRequest {
     pub domain: String,
-    pub owner_peer_id: String,
 }
 
 #[derive(Serialize)]
@@ -42,10 +55,14 @@ pub struct DnsRecords {
 
 pub async fn create_domain(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<CreateDomainRequest>,
 ) -> Result<Json<CreateDomainResponse>, MailError> {
+    // Use the authenticated user's peer_id as domain owner
+    let owner_peer_id = &user.peer_id;
+
     // Validate peer ID format
-    crate::crypto::ed25519_pubkey_from_peer_id(&req.owner_peer_id)
+    crate::crypto::ed25519_pubkey_from_peer_id(owner_peer_id)
         .map_err(|e| MailError::InvalidPeerId(e.to_string()))?;
 
     // Generate DKIM keypair for this domain
@@ -53,7 +70,7 @@ pub async fn create_domain(
 
     let domain_id = state.db.create_domain(
         &req.domain,
-        &req.owner_peer_id,
+        owner_peer_id,
         "fula",
         &dkim_private,
         &dkim_public,
@@ -70,13 +87,19 @@ pub async fn create_domain(
 
 pub async fn get_domain(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(domain): Path<String>,
 ) -> Result<Json<serde_json::Value>, MailError> {
     let record = state.db.get_domain_by_name(&domain).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::DomainNotFound(domain.clone()))?;
 
-    // Always check DNS live — no cached flags
+    // Only domain owner can view domain details
+    if record.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the domain owner".to_string()));
+    }
+
+    // Always check DNS live -- no cached flags
     let verification = dns::verify_domain_dns(&domain, &state.config.mx_hostname, &record.dkim_public_key, &record.dkim_selector).await
         .unwrap_or(dns::DnsVerification { mx: false, spf: false, dkim: false, dmarc: false });
 
@@ -102,11 +125,16 @@ pub async fn get_domain(
 
 pub async fn verify_domain(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(domain): Path<String>,
 ) -> Result<Json<serde_json::Value>, MailError> {
     let record = state.db.get_domain_by_name(&domain).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::DomainNotFound(domain.clone()))?;
+
+    if record.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the domain owner".to_string()));
+    }
 
     // Always real-time DNS check
     let verification = dns::verify_domain_dns(&domain, &state.config.mx_hostname, &record.dkim_public_key, &record.dkim_selector).await
@@ -135,11 +163,16 @@ pub async fn verify_domain(
 
 pub async fn get_dns_records(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(domain): Path<String>,
 ) -> Result<Json<DnsRecords>, MailError> {
     let record = state.db.get_domain_by_name(&domain).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::DomainNotFound(domain.clone()))?;
+
+    if record.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the domain owner".to_string()));
+    }
 
     let records = dns::required_dns_records(&domain, &state.config.mx_hostname, &record.dkim_public_key, &record.dkim_selector);
     Ok(Json(records))
@@ -150,28 +183,34 @@ pub async fn get_dns_records(
 #[derive(Deserialize)]
 pub struct CreateAddressRequest {
     pub email: String,
-    pub peer_id: String,
 }
 
 pub async fn create_address(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<CreateAddressRequest>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    // Extract domain from email
-    let domain = req.email
-        .split('@')
-        .nth(1)
-        .ok_or_else(|| MailError::Internal(anyhow::anyhow!("Invalid email format")))?;
+    // Validate email format: must have exactly one @
+    let parts: Vec<&str> = req.email.split('@').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(MailError::InvalidInput("Invalid email format".to_string()));
+    }
+    let domain = parts[1];
 
     let domain_record = state.db.get_domain_by_name(domain).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::DomainNotFound(domain.to_string()))?;
 
+    // Verify the authenticated user owns this domain
+    if domain_record.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the domain owner".to_string()));
+    }
+
     if domain_record.status != "active" {
         return Err(MailError::DomainNotVerified(domain.to_string()));
     }
 
-    let id = state.db.create_address(&req.email, domain_record.id, &req.peer_id).await
+    let id = state.db.create_address(&req.email, domain_record.id, &user.peer_id).await
         .map_err(|e| {
             if e.to_string().contains("duplicate") || e.to_string().contains("unique") {
                 MailError::AddressExists(req.email.clone())
@@ -192,14 +231,9 @@ pub async fn create_address(
 
 pub async fn list_pending_mail(
     State(state): State<Arc<AppState>>,
-    // TODO: extract user identity from JWT bearer token
-    // For now, require peer_id as query param for development
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    let peer_id = params.get("peer_id")
-        .ok_or(MailError::Unauthorized)?;
-
-    let pending = state.db.list_pending_for_peer(peer_id).await
+    let pending = state.db.list_pending_for_peer(&user.peer_id).await
         .map_err(|e| MailError::Internal(e))?;
 
     let items: Vec<serde_json::Value> = pending.iter().map(|p| {
@@ -218,42 +252,38 @@ pub async fn list_pending_mail(
 
 pub async fn get_raw_mail(
     State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
     Path(queue_id): Path<Uuid>,
 ) -> Result<axum::response::Response, MailError> {
-    let entry = state.db.get_queue_entry(queue_id).await
+    // Atomically claim the entry (TOCTOU fix: UPDATE...WHERE status='pending' RETURNING)
+    let entry = state.db.claim_queue_entry(queue_id).await
         .map_err(|e| MailError::Internal(e))?
-        .ok_or_else(|| MailError::QueueNotFound(queue_id.to_string()))?;
-
-    if entry.status != "pending" {
-        return Err(MailError::QueueNotFound(format!("Entry {} is not pending", queue_id)));
-    }
+        .ok_or_else(|| MailError::QueueNotFound(format!("Entry {} not found or already picked up", queue_id)))?;
 
     let data = tokio::fs::read(&entry.storage_path).await
         .map_err(|e| MailError::Internal(anyhow::anyhow!("Cannot read temp file: {}", e)))?;
 
-    Ok(axum::response::Response::builder()
+    axum::response::Response::builder()
         .header("Content-Type", "message/rfc822")
         .header("X-Queue-Id", queue_id.to_string())
         .body(axum::body::Body::from(data))
-        .unwrap())
+        .map_err(|e| MailError::Internal(anyhow::anyhow!("Response build failed: {}", e)))
 }
 
 pub async fn ack_mail_pickup(
     State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
     Path(queue_id): Path<Uuid>,
 ) -> Result<StatusCode, MailError> {
     let entry = state.db.get_queue_entry(queue_id).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::QueueNotFound(queue_id.to_string()))?;
 
-    // Mark as picked up
-    state.db.mark_picked_up(queue_id).await
-        .map_err(|e| MailError::Internal(e))?;
-
-    // Delete temp file
+    // Entry should already be 'picked_up' from get_raw_mail's claim_queue_entry.
+    // Delete temp file.
     let _ = tokio::fs::remove_file(&entry.storage_path).await;
 
-    tracing::info!("Path A: client picked up queue_id={}", queue_id);
+    tracing::info!("Path A: client acknowledged queue_id={}", queue_id);
     Ok(StatusCode::OK)
 }
 
@@ -268,11 +298,17 @@ pub struct PushTokenRequest {
 
 pub async fn register_push_token(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<PushTokenRequest>,
 ) -> Result<StatusCode, MailError> {
     let addr = state.db.get_address_by_email(&req.email).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::AddressNotFound(req.email.clone()))?;
+
+    // Only the address owner can register push tokens
+    if addr.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the address owner".to_string()));
+    }
 
     state.db.update_push_token(addr.id, &req.token, &req.platform).await
         .map_err(|e| MailError::Internal(e))?;
@@ -284,35 +320,42 @@ pub async fn register_push_token(
 
 pub async fn set_relay_config(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SetRelayConfigRequest>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    // Verify address exists
-    state.db.get_address_by_email(&req.email).await
+    // Verify address exists and user owns it
+    let addr = state.db.get_address_by_email(&req.email).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::AddressNotFound(req.email.clone()))?;
+
+    if addr.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the address owner".to_string()));
+    }
 
     state.db.set_relay_config(&req.email, &req.relay).await
         .map_err(|e| MailError::Internal(e))?;
 
-    tracing::info!("Relay config set for {}: {:?}", req.email, req.relay);
+    // Log provider name only -- never log the config struct (contains secrets)
+    tracing::info!("Relay config set for {}: provider={}", req.email, req.relay.provider_name());
     Ok(Json(serde_json::json!({
         "email": req.email,
-        "provider": match &req.relay {
-            crate::db::RelayConfig::SendGrid { .. } => "sendgrid",
-            crate::db::RelayConfig::Mailgun { .. } => "mailgun",
-            crate::db::RelayConfig::Smtp { .. } => "smtp",
-        },
+        "provider": req.relay.provider_name(),
         "status": "configured",
     })))
 }
 
 pub async fn get_relay_config(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(email): Path<String>,
 ) -> Result<Json<serde_json::Value>, MailError> {
     let addr = state.db.get_address_by_email(&email).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::AddressNotFound(email.clone()))?;
+
+    if addr.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the address owner".to_string()));
+    }
 
     let relay = addr.relay_config();
     Ok(Json(serde_json::json!({
@@ -324,8 +367,17 @@ pub async fn get_relay_config(
 
 pub async fn delete_relay_config(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(email): Path<String>,
 ) -> Result<StatusCode, MailError> {
+    let addr = state.db.get_address_by_email(&email).await
+        .map_err(|e| MailError::Internal(e))?
+        .ok_or_else(|| MailError::AddressNotFound(email.clone()))?;
+
+    if addr.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the address owner".to_string()));
+    }
+
     state.db.clear_relay_config(&email).await
         .map_err(|e| MailError::Internal(e))?;
     Ok(StatusCode::OK)
@@ -351,14 +403,24 @@ pub struct OutboundRequest {
 
 pub async fn submit_outbound(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<OutboundRequest>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    // TODO: authenticate via JWT (same as FxFiles)
-    let message_id = crate::outbound::send_outbound(&state.config, &state.db, &req).await
+    // Verify the sender address belongs to the authenticated user
+    let addr = state.db.get_address_by_email(&req.from).await
+        .map_err(|e| MailError::Internal(e))?
+        .ok_or_else(|| MailError::AddressNotFound(req.from.clone()))?;
+
+    if addr.owner_peer_id != user.peer_id {
+        return Err(MailError::Forbidden("Not the sender address owner".to_string()));
+    }
+
+    // Enqueue for delivery (worker picks it up with retry logic)
+    let queue_id = crate::outbound::enqueue_outbound(&state.db, &req, addr.id).await
         .map_err(|e| MailError::Internal(e))?;
 
     Ok(Json(serde_json::json!({
-        "status": "sent",
-        "message_id": message_id,
+        "status": "queued",
+        "queue_id": queue_id,
     })))
 }

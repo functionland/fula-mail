@@ -4,6 +4,10 @@
 //! mail_delivery_log). User identity, peer IDs, and auth data are queried from the
 //! existing pinning-service/fula-api tables -- never duplicated.
 
+use std::collections::HashSet;
+use std::fmt;
+use std::time::Duration;
+
 use anyhow::Result;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
@@ -13,17 +17,43 @@ use crate::config::Config;
 #[derive(Clone)]
 pub struct Database {
     pool: PgPool,
+    /// Master key for encrypting secrets at rest (DKIM keys, relay API keys).
+    /// None = plaintext mode (backwards-compatible).
+    master_key: Option<String>,
 }
 
 impl Database {
     pub async fn connect(config: &Config) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(25)
+            .acquire_timeout(Duration::from_secs(30))
+            .idle_timeout(Duration::from_secs(300))
             .connect(&config.database_url())
             .await?;
 
         tracing::info!("Connected to shared PostgreSQL at {}:{}", config.postgres_host, config.postgres_port);
-        Ok(Self { pool })
+        if config.encryption_master_key.is_some() {
+            tracing::info!("Secret encryption at rest: ENABLED");
+        } else {
+            tracing::warn!("Secret encryption at rest: DISABLED (set ENCRYPTION_MASTER_KEY to enable)");
+        }
+        Ok(Self { pool, master_key: config.encryption_master_key.clone() })
+    }
+
+    fn encrypt(&self, plaintext: &str) -> Result<String> {
+        crate::secrets::encrypt_secret(plaintext, self.master_key.as_deref())
+    }
+
+    fn decrypt(&self, stored: &str) -> Result<String> {
+        crate::secrets::decrypt_secret(stored, self.master_key.as_deref())
+    }
+
+    /// Quick connectivity check for the health endpoint.
+    pub async fn health_check(&self) -> bool {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .is_ok()
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
@@ -34,6 +64,12 @@ impl Database {
 
         let migration_002 = include_str!("../migrations/postgres/002_relay_config.sql");
         sqlx::raw_sql(migration_002).execute(&self.pool).await?;
+
+        let migration_003 = include_str!("../migrations/postgres/003_hardening.sql");
+        sqlx::raw_sql(migration_003).execute(&self.pool).await?;
+
+        let migration_004 = include_str!("../migrations/postgres/004_outbound_queue.sql");
+        sqlx::raw_sql(migration_004).execute(&self.pool).await?;
 
         tracing::info!("Email migrations applied");
         Ok(())
@@ -49,6 +85,8 @@ impl Database {
         dkim_private_key: &str,
         dkim_public_key: &str,
     ) -> Result<Uuid> {
+        let encrypted_private_key = self.encrypt(dkim_private_key)?;
+
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO mail_domains (domain, owner_peer_id, dkim_selector, dkim_private_key, dkim_public_key)
              VALUES ($1, $2, $3, $4, $5)
@@ -57,7 +95,7 @@ impl Database {
         .bind(domain)
         .bind(owner_peer_id)
         .bind(dkim_selector)
-        .bind(dkim_private_key)
+        .bind(&encrypted_private_key)
         .bind(dkim_public_key)
         .fetch_one(&self.pool)
         .await?;
@@ -75,7 +113,13 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(record)
+        match record {
+            Some(mut r) => {
+                r.dkim_private_key = self.decrypt(&r.dkim_private_key)?;
+                Ok(Some(r))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn update_domain_verification(
@@ -102,6 +146,17 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Load all known domain names for SMTP recipient validation cache.
+    pub async fn list_known_domains(&self) -> Result<HashSet<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT domain FROM mail_domains WHERE status IN ('active', 'pending_verification')"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 
     // ---- Address operations ----
@@ -139,7 +194,17 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(record)
+        match record {
+            Some(mut r) => {
+                // Decrypt secrets read from DB
+                r.dkim_private_key = self.decrypt(&r.dkim_private_key)?;
+                if let Some(ref key) = r.relay_api_key {
+                    r.relay_api_key = Some(self.decrypt(key)?);
+                }
+                Ok(Some(r))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn update_push_token(
@@ -165,17 +230,19 @@ impl Database {
     pub async fn set_relay_config(&self, email: &str, config: &RelayConfig) -> Result<()> {
         match config {
             RelayConfig::SendGrid { api_key } => {
+                let encrypted_key = self.encrypt(api_key)?;
                 sqlx::query(
                     "UPDATE mail_addresses SET relay_provider = 'sendgrid', relay_api_key = $2,
                      relay_smtp_host = NULL, relay_smtp_port = NULL, relay_smtp_user = NULL, relay_mailgun_domain = NULL
                      WHERE email = $1"
                 )
                 .bind(email)
-                .bind(api_key)
+                .bind(&encrypted_key)
                 .execute(&self.pool)
                 .await?;
             }
             RelayConfig::Mailgun { api_key, domain } => {
+                let encrypted_key = self.encrypt(api_key)?;
                 sqlx::query(
                     "UPDATE mail_addresses SET relay_provider = 'mailgun', relay_api_key = $2,
                      relay_mailgun_domain = $3,
@@ -183,12 +250,13 @@ impl Database {
                      WHERE email = $1"
                 )
                 .bind(email)
-                .bind(api_key)
+                .bind(&encrypted_key)
                 .bind(domain)
                 .execute(&self.pool)
                 .await?;
             }
             RelayConfig::Smtp { host, port, username, password } => {
+                let encrypted_password = self.encrypt(password)?;
                 sqlx::query(
                     "UPDATE mail_addresses SET relay_provider = 'smtp', relay_api_key = $2,
                      relay_smtp_host = $3, relay_smtp_port = $4, relay_smtp_user = $5,
@@ -196,7 +264,7 @@ impl Database {
                      WHERE email = $1"
                 )
                 .bind(email)
-                .bind(password)
+                .bind(&encrypted_password)
                 .bind(host)
                 .bind(*port as i32)
                 .bind(username)
@@ -229,7 +297,7 @@ impl Database {
         message_id: &str,
         sender: &str,
         subject: Option<&str>,
-        raw_size: i32,
+        raw_size: i64,
         storage_path: &str,
         ttl_secs: u64,
     ) -> Result<Uuid> {
@@ -251,15 +319,20 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn mark_picked_up(&self, queue_id: Uuid) -> Result<()> {
-        sqlx::query(
-            "UPDATE mail_inbound_queue SET status = 'picked_up', picked_up_at = NOW() WHERE id = $1"
+    /// Atomically claim a pending queue entry for reading (TOCTOU fix).
+    /// Returns the entry only if it was in 'pending' status, and sets it to 'picked_up'.
+    pub async fn claim_queue_entry(&self, queue_id: Uuid) -> Result<Option<QueueEntryRecord>> {
+        let record = sqlx::query_as::<_, QueueEntryRecord>(
+            "UPDATE mail_inbound_queue
+             SET status = 'picked_up', picked_up_at = NOW()
+             WHERE id = $1 AND status = 'pending'
+             RETURNING id, address_id, message_id, storage_path, status"
         )
         .bind(queue_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(record)
     }
 
     pub async fn list_pending_for_peer(&self, peer_id: &str) -> Result<Vec<PendingMailRecord>> {
@@ -289,13 +362,15 @@ impl Database {
         Ok(record)
     }
 
-    pub async fn get_expired_pending(&self) -> Result<Vec<InboundQueueRecord>> {
+    /// Get expired pending entries, limited to those under max retries.
+    pub async fn get_expired_pending(&self, max_retries: i32) -> Result<Vec<InboundQueueRecord>> {
         let records = sqlx::query_as::<_, InboundQueueRecord>(
-            "SELECT q.id, q.address_id, q.message_id, q.storage_path, a.owner_peer_id
+            "SELECT q.id, q.address_id, q.message_id, q.storage_path, a.owner_peer_id, q.retry_count
              FROM mail_inbound_queue q
              JOIN mail_addresses a ON a.id = q.address_id
-             WHERE q.status = 'pending' AND q.expires_at < NOW()"
+             WHERE q.status = 'pending' AND q.expires_at < NOW() AND q.retry_count < $1"
         )
+        .bind(max_retries)
         .fetch_all(&self.pool)
         .await?;
 
@@ -308,6 +383,127 @@ impl Database {
         )
         .bind(queue_id)
         .bind(cid)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Increment retry count for a failed Path B attempt.
+    pub async fn increment_retry_count(&self, queue_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_inbound_queue SET retry_count = retry_count + 1 WHERE id = $1"
+        )
+        .bind(queue_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark entry as permanently failed after max retries exhausted.
+    pub async fn mark_permanently_failed(&self, queue_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_inbound_queue SET status = 'permanently_failed' WHERE id = $1"
+        )
+        .bind(queue_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ---- Outbound queue (H4: retry logic) ----
+
+    pub async fn enqueue_outbound(
+        &self,
+        address_id: Uuid,
+        sender: &str,
+        recipients: &[String],
+        subject: &str,
+        body: &str,
+        content_type: &str,
+    ) -> Result<Uuid> {
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO mail_outbound_queue (address_id, sender, recipients, subject, body, content_type)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id"
+        )
+        .bind(address_id)
+        .bind(sender)
+        .bind(recipients)
+        .bind(subject)
+        .bind(body)
+        .bind(content_type)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    /// Claim the next batch of outbound messages ready for delivery.
+    /// Atomically sets status to 'sending' so no other worker picks them up.
+    pub async fn claim_outbound_batch(&self, limit: i64) -> Result<Vec<OutboundQueueRecord>> {
+        let records = sqlx::query_as::<_, OutboundQueueRecord>(
+            "UPDATE mail_outbound_queue
+             SET status = 'sending', updated_at = NOW()
+             WHERE id IN (
+                 SELECT id FROM mail_outbound_queue
+                 WHERE status = 'pending' AND next_retry_at <= NOW()
+                 ORDER BY next_retry_at ASC
+                 LIMIT $1
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id, address_id, sender, recipients, subject, body, content_type, retry_count"
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Mark an outbound message as sent.
+    pub async fn mark_outbound_sent(&self, queue_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_outbound_queue SET status = 'sent', updated_at = NOW() WHERE id = $1"
+        )
+        .bind(queue_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark outbound message for retry with exponential backoff.
+    /// Backoff: 30s, 2min, 8min, 32min, 2h (base 30s * 4^retry_count).
+    pub async fn mark_outbound_retry(&self, queue_id: Uuid, error: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_outbound_queue
+             SET status = 'pending',
+                 retry_count = retry_count + 1,
+                 last_error = $2,
+                 next_retry_at = NOW() + make_interval(secs => 30.0 * power(4, retry_count)),
+                 updated_at = NOW()
+             WHERE id = $1"
+        )
+        .bind(queue_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark outbound message as permanently failed (5xx or max retries).
+    pub async fn mark_outbound_failed(&self, queue_id: Uuid, error: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_outbound_queue
+             SET status = 'permanently_failed', last_error = $2, updated_at = NOW()
+             WHERE id = $1"
+        )
+        .bind(queue_id)
+        .bind(error)
         .execute(&self.pool)
         .await?;
 
@@ -408,13 +604,49 @@ impl AddressRecord {
 }
 
 /// User's outbound relay configuration.
-/// Users bring their own API key — no IP warming needed for the gateway.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Users bring their own API key -- no IP warming needed for the gateway.
+///
+/// Debug impl redacts secrets to prevent leaking API keys in logs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum RelayConfig {
     SendGrid { api_key: String },
     Mailgun { api_key: String, domain: String },
     Smtp { host: String, port: u16, username: String, password: String },
+}
+
+impl fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelayConfig::SendGrid { .. } => {
+                f.debug_struct("SendGrid").field("api_key", &"[REDACTED]").finish()
+            }
+            RelayConfig::Mailgun { domain, .. } => {
+                f.debug_struct("Mailgun")
+                    .field("api_key", &"[REDACTED]")
+                    .field("domain", domain)
+                    .finish()
+            }
+            RelayConfig::Smtp { host, port, username, .. } => {
+                f.debug_struct("Smtp")
+                    .field("host", host)
+                    .field("port", port)
+                    .field("username", username)
+                    .field("password", &"[REDACTED]")
+                    .finish()
+            }
+        }
+    }
+}
+
+impl RelayConfig {
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            RelayConfig::SendGrid { .. } => "sendgrid",
+            RelayConfig::Mailgun { .. } => "mailgun",
+            RelayConfig::Smtp { .. } => "smtp",
+        }
+    }
 }
 
 #[derive(sqlx::FromRow, Debug)]
@@ -423,7 +655,7 @@ pub struct PendingMailRecord {
     pub message_id: String,
     pub sender: String,
     pub subject: Option<String>,
-    pub raw_size: i32,
+    pub raw_size: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -443,4 +675,17 @@ pub struct InboundQueueRecord {
     pub message_id: String,
     pub storage_path: String,
     pub owner_peer_id: String,
+    pub retry_count: i32,
+}
+
+#[derive(sqlx::FromRow, Debug)]
+pub struct OutboundQueueRecord {
+    pub id: Uuid,
+    pub address_id: Uuid,
+    pub sender: String,
+    pub recipients: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub content_type: String,
+    pub retry_count: i32,
 }

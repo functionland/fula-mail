@@ -1,18 +1,20 @@
 //! DNS verification and DKIM key management for custom domains.
 
 use anyhow::Result;
-use rsa::{pkcs8::EncodePrivateKey, pkcs8::EncodePublicKey, RsaPrivateKey};
+use rsa::{pkcs1::EncodeRsaPrivateKey, pkcs8::EncodePublicKey, RsaPrivateKey};
 
 use crate::handlers::DnsRecords;
 
 /// Generate a 2048-bit RSA keypair for DKIM signing.
+/// Private key is output as PKCS#1 PEM (compatible with lettre's DKIM signer).
 pub fn generate_dkim_keypair() -> Result<(String, String)> {
     let mut rng = rand::thread_rng();
     let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
     let public_key = private_key.to_public_key();
 
+    // PKCS#1 PEM for lettre DKIM compatibility
     let private_pem = private_key
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)?
+        .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)?
         .to_string();
 
     let public_der = public_key.to_public_key_der()?;
@@ -54,13 +56,17 @@ pub struct DnsVerification {
 pub async fn verify_domain_dns(
     domain: &str,
     expected_mx: &str,
-    _expected_dkim_pubkey: &str,
+    expected_dkim_pubkey: &str,
     dkim_selector: &str,
 ) -> Result<DnsVerification> {
+    use std::time::Duration;
     use trust_dns_resolver::TokioAsyncResolver;
     use trust_dns_resolver::config::*;
 
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+    let mut opts = ResolverOpts::default();
+    opts.timeout = Duration::from_secs(5);
+    opts.attempts = 2;
+    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), opts);
 
     // Check MX
     let mx_verified = match resolver.mx_lookup(domain).await {
@@ -79,12 +85,18 @@ pub async fn verify_domain_dns(
         Err(_) => false,
     };
 
-    // Check DKIM (TXT record on selector._domainkey.domain)
+    // Check DKIM: verify record exists AND the p= value matches our stored public key
     let dkim_name = format!("{dkim_selector}._domainkey.{domain}");
     let dkim_verified = match resolver.txt_lookup(&dkim_name).await {
         Ok(txt) => txt.iter().any(|r| {
             let text = r.to_string();
-            text.contains("v=DKIM1")
+            if !text.contains("v=DKIM1") {
+                return false;
+            }
+            // Extract p= value from DKIM TXT record and compare with stored key
+            extract_dkim_pubkey(&text)
+                .map(|dns_key| normalize_b64(&dns_key) == normalize_b64(expected_dkim_pubkey))
+                .unwrap_or(false)
         }),
         Err(_) => false,
     };
@@ -102,4 +114,23 @@ pub async fn verify_domain_dns(
         dkim: dkim_verified,
         dmarc: dmarc_verified,
     })
+}
+
+/// Extract the public key (p= value) from a DKIM TXT record.
+fn extract_dkim_pubkey(txt: &str) -> Option<String> {
+    for part in txt.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("p=") {
+            let key = value.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Normalize base64 by removing whitespace for comparison.
+fn normalize_b64(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }

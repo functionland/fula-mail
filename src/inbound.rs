@@ -15,8 +15,11 @@ use crate::{crypto, server::AppState};
 /// 4. Store encrypted blob via pinning service
 /// 5. Mark queue entry as fallback_encrypted with the CID
 /// 6. Delete temp file
+///
+/// Failed entries are retried up to max_retries times, then marked permanently_failed.
 pub async fn run_expiry_worker(state: Arc<AppState>) -> anyhow::Result<()> {
-    tracing::info!("Path A expiry worker started (TTL: {}s)", state.config.path_a_ttl_secs);
+    tracing::info!("Path A expiry worker started (TTL: {}s, max_retries: {})",
+        state.config.path_a_ttl_secs, state.config.max_retries);
 
     loop {
         sleep(Duration::from_secs(30)).await;
@@ -34,7 +37,7 @@ pub async fn run_expiry_worker(state: Arc<AppState>) -> anyhow::Result<()> {
 }
 
 async fn process_expired(state: &AppState) -> anyhow::Result<usize> {
-    let expired = state.db.get_expired_pending().await?;
+    let expired = state.db.get_expired_pending(state.config.max_retries).await?;
     let mut count = 0;
 
     for entry in expired {
@@ -43,6 +46,13 @@ async fn process_expired(state: &AppState) -> anyhow::Result<usize> {
             Ok(data) => data,
             Err(e) => {
                 tracing::error!("Cannot read temp file {}: {}", entry.storage_path, e);
+                // File missing -- mark permanently failed, nothing to retry
+                state.db.mark_permanently_failed(entry.id).await?;
+                state.db.log_delivery(
+                    "inbound", Some(entry.address_id), Some(&entry.message_id),
+                    "", "", "failed", None,
+                    Some(&format!("Temp file unreadable: {}", e)), None,
+                ).await?;
                 continue;
             }
         };
@@ -51,7 +61,18 @@ async fn process_expired(state: &AppState) -> anyhow::Result<usize> {
         let encrypted = match crypto::encrypt_for_peer(&entry.owner_peer_id, &raw) {
             Ok(data) => data,
             Err(e) => {
-                tracing::error!("Encryption failed for peer {}: {}", entry.owner_peer_id, e);
+                tracing::error!("Encryption failed for peer {} (retry {}/{}): {}",
+                    entry.owner_peer_id, entry.retry_count + 1, state.config.max_retries, e);
+                state.db.increment_retry_count(entry.id).await?;
+                if entry.retry_count + 1 >= state.config.max_retries {
+                    state.db.mark_permanently_failed(entry.id).await?;
+                    state.db.log_delivery(
+                        "inbound", Some(entry.address_id), Some(&entry.message_id),
+                        "", "", "failed", None,
+                        Some(&format!("Encryption permanently failed: {}", e)), None,
+                    ).await?;
+                    let _ = tokio::fs::remove_file(&entry.storage_path).await;
+                }
                 continue;
             }
         };
@@ -62,7 +83,18 @@ async fn process_expired(state: &AppState) -> anyhow::Result<usize> {
         let cid = match state.pinning.store_and_pin(&encrypted, &name, &state.config.pinning_system_key).await {
             Ok(cid) => cid,
             Err(e) => {
-                tracing::error!("Pinning failed for {}: {}", entry.message_id, e);
+                tracing::error!("Pinning failed for {} (retry {}/{}): {}",
+                    entry.message_id, entry.retry_count + 1, state.config.max_retries, e);
+                state.db.increment_retry_count(entry.id).await?;
+                if entry.retry_count + 1 >= state.config.max_retries {
+                    state.db.mark_permanently_failed(entry.id).await?;
+                    state.db.log_delivery(
+                        "inbound", Some(entry.address_id), Some(&entry.message_id),
+                        "", "", "failed", None,
+                        Some(&format!("Pinning permanently failed: {}", e)), None,
+                    ).await?;
+                    let _ = tokio::fs::remove_file(&entry.storage_path).await;
+                }
                 continue;
             }
         };

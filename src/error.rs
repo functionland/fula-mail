@@ -36,6 +36,15 @@ pub enum MailError {
     #[error("Unauthorized")]
     Unauthorized,
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("Message too large")]
+    MessageTooLarge,
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -51,9 +60,11 @@ impl IntoResponse for MailError {
             }
             MailError::DomainNotVerified(_) => (StatusCode::PRECONDITION_FAILED, self.to_string()),
             MailError::AddressExists(_) => (StatusCode::CONFLICT, self.to_string()),
-            MailError::InvalidPeerId(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            MailError::InvalidPeerId(_) | MailError::InvalidInput(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             MailError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            MailError::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
             MailError::QueueExpired => (StatusCode::GONE, self.to_string()),
+            MailError::MessageTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
             _ => {
                 tracing::error!("Internal error: {}", self);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())

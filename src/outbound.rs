@@ -1,4 +1,4 @@
-//! Outbound mail processing: DKIM signing and SMTP relay.
+//! Outbound mail processing: DKIM signing and SMTP relay with retry queue.
 //!
 //! Users bring their own relay API key (BYOK). Supported providers:
 //! - **SendGrid**: Web API (recommended, easiest setup)
@@ -10,84 +10,188 @@
 //!
 //! Flow:
 //! 1. FxMail submits plaintext message via HTTPS API (authenticated with JWT)
-//! 2. Gateway looks up sender's relay config (per-user BYOK or global fallback)
-//! 3. TODO: DKIM-signs the message with domain's private key
-//! 4. Relays via the user's relay provider
-//! 5. Does NOT store plaintext (fire-and-forget)
+//! 2. Message is enqueued in mail_outbound_queue (persistent)
+//! 3. Outbound worker picks it up, looks up sender's relay config
+//! 4. TODO: DKIM-signs the message with domain's private key
+//! 5. Relays via the user's relay provider
+//! 6. On transient failure (4xx): retry with exponential backoff
+//! 7. On permanent failure (5xx) or max retries: mark permanently_failed
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use lettre::{
-    message::header::ContentType,
+    message::{
+        header::ContentType,
+        dkim::{DkimConfig, DkimSigningAlgorithm, DkimSigningKey},
+    },
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
+use tokio::time::{sleep, Duration};
 
-use crate::{config::Config, db::{Database, RelayConfig}, handlers::OutboundRequest};
+use crate::{config::Config, db::{Database, RelayConfig}, handlers::OutboundRequest, server::AppState};
 
-/// Send an outbound email: build message, resolve relay, deliver.
-pub async fn send_outbound(
-    config: &Config,
+/// Maximum retries for outbound messages before marking permanently failed.
+const MAX_OUTBOUND_RETRIES: i32 = 5;
+
+/// Enqueue an outbound email for delivery. Returns immediately with the queue ID.
+pub async fn enqueue_outbound(
     db: &Database,
     req: &OutboundRequest,
+    address_id: uuid::Uuid,
+) -> Result<uuid::Uuid> {
+    let content_type = req.content_type.as_deref().unwrap_or("text/plain");
+    let queue_id = db.enqueue_outbound(
+        address_id,
+        &req.from,
+        &req.to,
+        &req.subject,
+        &req.body,
+        content_type,
+    ).await?;
+
+    tracing::info!("Enqueued outbound mail {} -> {:?} (queue_id={})", req.from, req.to, queue_id);
+    Ok(queue_id)
+}
+
+/// Background worker that processes the outbound mail queue.
+/// Runs every 10 seconds, claims a batch of pending messages, and delivers them.
+pub async fn run_outbound_worker(state: Arc<AppState>) -> anyhow::Result<()> {
+    tracing::info!("Outbound delivery worker started (max_retries: {})", MAX_OUTBOUND_RETRIES);
+
+    loop {
+        sleep(Duration::from_secs(10)).await;
+
+        match process_outbound_batch(&state).await {
+            Ok(count) if count > 0 => {
+                tracing::info!("Delivered {} outbound messages", count);
+            }
+            Err(e) => {
+                tracing::error!("Outbound worker error: {}", e);
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn process_outbound_batch(state: &AppState) -> Result<usize> {
+    let batch = state.db.claim_outbound_batch(20).await?;
+    let mut delivered = 0;
+
+    for entry in batch {
+        match deliver_one(&state.config, &state.db, &entry).await {
+            Ok(message_id) => {
+                state.db.mark_outbound_sent(entry.id).await?;
+                for recip in &entry.recipients {
+                    state.db.log_delivery(
+                        "outbound", Some(entry.address_id), Some(&message_id),
+                        &entry.sender, recip, "sent", None, None, None,
+                    ).await?;
+                }
+                delivered += 1;
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let is_permanent = is_permanent_failure(&error_str);
+
+                if is_permanent || entry.retry_count + 1 >= MAX_OUTBOUND_RETRIES {
+                    let reason = if is_permanent {
+                        format!("Permanent failure: {}", error_str)
+                    } else {
+                        format!("Max retries ({}) exhausted: {}", MAX_OUTBOUND_RETRIES, error_str)
+                    };
+                    tracing::error!("Outbound permanently failed for {}: {}", entry.sender, reason);
+                    state.db.mark_outbound_failed(entry.id, &reason).await?;
+                    for recip in &entry.recipients {
+                        state.db.log_delivery(
+                            "outbound", Some(entry.address_id), None,
+                            &entry.sender, recip, "failed", None, Some(&reason), None,
+                        ).await?;
+                    }
+                } else {
+                    tracing::warn!("Outbound transient failure for {} (retry {}/{}): {}",
+                        entry.sender, entry.retry_count + 1, MAX_OUTBOUND_RETRIES, error_str);
+                    state.db.mark_outbound_retry(entry.id, &error_str).await?;
+                }
+            }
+        }
+    }
+
+    Ok(delivered)
+}
+
+/// Deliver a single outbound message. On success, returns the relay's message ID.
+async fn deliver_one(
+    config: &Config,
+    db: &Database,
+    entry: &crate::db::OutboundQueueRecord,
 ) -> Result<String> {
-    // Look up sender's address record (contains domain DKIM info + relay config)
-    let addr = db.get_address_by_email(&req.from).await?
-        .ok_or_else(|| anyhow::anyhow!("Sender address not found: {}", req.from))?;
+    let addr = db.get_address_by_email(&entry.sender).await?
+        .ok_or_else(|| anyhow::anyhow!("Sender address not found: {}", entry.sender))?;
 
     if addr.domain_status != "active" {
-        anyhow::bail!("Sender domain not active");
+        anyhow::bail!("Sender domain not active (permanent)");
     }
 
     // Build the email message
-    let content_type = req.content_type.as_deref().unwrap_or("text/plain");
     let mut email_builder = Message::builder()
-        .from(req.from.parse()?)
-        .subject(&req.subject);
+        .from(entry.sender.parse()?)
+        .subject(&entry.subject);
 
-    for to in &req.to {
+    for to in &entry.recipients {
         email_builder = email_builder.to(to.parse()?);
     }
 
-    let email = if content_type.contains("html") {
+    let mut email = if entry.content_type.contains("html") {
         email_builder.header(ContentType::TEXT_HTML)
-            .body(req.body.clone())?
+            .body(entry.body.clone())?
     } else {
         email_builder.header(ContentType::TEXT_PLAIN)
-            .body(req.body.clone())?
+            .body(entry.body.clone())?
     };
 
-    // TODO: DKIM sign the message using domain's private key
-    // let signed = dkim_sign(&email, &addr.dkim_private_key, &addr.dkim_selector, &addr.domain)?;
+    // DKIM sign the message using domain's private key (PKCS#1 PEM)
+    if let Ok(signing_key) = DkimSigningKey::new(&addr.dkim_private_key, DkimSigningAlgorithm::Rsa) {
+        let dkim_config = DkimConfig::default_config(
+            addr.dkim_selector.clone(),
+            addr.domain.clone(),
+            signing_key,
+        );
+        lettre::message::dkim::dkim_sign(&mut email, &dkim_config);
+        tracing::debug!("DKIM signed outbound mail for {}", addr.domain);
+    } else {
+        tracing::warn!("Failed to load DKIM key for domain {}, sending unsigned", addr.domain);
+    }
 
     // Resolve relay: per-user BYOK first, then global fallback
     let relay = addr.relay_config()
         .or_else(|| global_relay_config(config));
 
-    let message_id = match relay {
-        Some(relay_config) => relay_via_provider(&relay_config, &email).await?,
+    match relay {
+        Some(relay_config) => relay_via_provider(&relay_config, &email).await,
         None => anyhow::bail!(
-            "No outbound relay configured for {}. Set up SendGrid, Mailgun, or SMTP relay in FxMail settings.",
-            req.from
+            "No outbound relay configured for {} (permanent)", entry.sender
         ),
-    };
-
-    // Log delivery
-    for to in &req.to {
-        db.log_delivery(
-            "outbound",
-            Some(addr.id),
-            Some(&message_id),
-            &req.from,
-            to,
-            "sent",
-            None,
-            None,
-            None,
-        ).await?;
     }
+}
 
-    tracing::info!("Outbound mail sent: {} -> {:?} (message_id={})", req.from, req.to, message_id);
-    Ok(message_id)
+/// Heuristic: is this a permanent failure that should not be retried?
+fn is_permanent_failure(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    // 5xx SMTP codes, explicit "permanent" markers, auth failures, domain issues
+    lower.contains("550 ")
+        || lower.contains("551 ")
+        || lower.contains("552 ")
+        || lower.contains("553 ")
+        || lower.contains("554 ")
+        || lower.contains("555 ")
+        || lower.contains("(permanent)")
+        || lower.contains("authentication failed")
+        || lower.contains("relay access denied")
+        || lower.contains("sender address not found")
+        || lower.contains("domain not active")
+        || lower.contains("no outbound relay configured")
 }
 
 /// Build a RelayConfig from the global env config (fallback when user has no BYOK).
@@ -120,14 +224,6 @@ async fn relay_via_provider(relay: &RelayConfig, email: &Message) -> Result<Stri
 async fn relay_sendgrid(api_key: &str, email: &Message) -> Result<String> {
     let client = reqwest::Client::new();
 
-    // Extract fields from the Message
-    let raw = email.formatted();
-    let raw_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &raw,
-    );
-
-    // SendGrid v3 mail/send with raw MIME
     let resp = client
         .post("https://api.sendgrid.com/v3/mail/send")
         .bearer_auth(api_key)
@@ -143,16 +239,11 @@ async fn relay_sendgrid(api_key: &str, email: &Message) -> Result<String> {
                 "type": "text/plain",
                 "value": " " // placeholder — raw content below overrides
             }],
-            "headers": {},
-            "mail_settings": {
-                "bypass_list_management": { "enable": false }
-            }
         }))
         .send()
         .await?;
 
     if resp.status().is_success() || resp.status().as_u16() == 202 {
-        // SendGrid returns message ID in x-message-id header
         let msg_id = resp.headers()
             .get("x-message-id")
             .and_then(|v| v.to_str().ok())
@@ -162,13 +253,18 @@ async fn relay_sendgrid(api_key: &str, email: &Message) -> Result<String> {
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("SendGrid API error ({}): {}", status, body)
+        // 4xx from SendGrid = usually auth/validation issue (permanent)
+        // 5xx = server error (transient)
+        if status.as_u16() >= 500 {
+            anyhow::bail!("SendGrid server error ({}): {}", status, body)
+        } else {
+            anyhow::bail!("SendGrid API error ({}) (permanent): {}", status, body)
+        }
     }
 }
 
 /// Send via Mailgun SMTP relay.
 async fn relay_mailgun(api_key: &str, _domain: &str, email: &Message) -> Result<String> {
-    // Mailgun SMTP: smtp.mailgun.org:587, user=postmaster@domain, password=api_key
     relay_smtp("smtp.mailgun.org", 587, "api", api_key, email).await
 }
 

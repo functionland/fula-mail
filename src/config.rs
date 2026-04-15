@@ -24,6 +24,7 @@ pub struct Config {
     // TLS
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
+    pub tls_chain_path: Option<PathBuf>,
 
     // Auth (same JWT as FxFiles/pinning-service)
     pub jwt_secret: String,
@@ -43,6 +44,14 @@ pub struct Config {
 
     // Path A settings
     pub path_a_ttl_secs: u64,
+
+    // Limits
+    pub max_message_size: usize,
+    pub max_retries: i32,
+
+    // Encryption master key for secrets at rest (hex-encoded 32-byte key)
+    // Used to encrypt DKIM private keys and relay API keys in the database.
+    pub encryption_master_key: Option<String>,
 }
 
 impl Config {
@@ -67,6 +76,7 @@ impl Config {
 
             tls_cert_path: env_opt("TLS_CERT_PATH").map(PathBuf::from),
             tls_key_path: env_opt("TLS_KEY_PATH").map(PathBuf::from),
+            tls_chain_path: env_opt("TLS_CHAIN_PATH").map(PathBuf::from),
 
             jwt_secret: env_required("JWT_SECRET")?,
 
@@ -82,7 +92,66 @@ impl Config {
             outbound_relay_password: env_opt("OUTBOUND_RELAY_PASSWORD"),
 
             path_a_ttl_secs: env_or("PATH_A_TTL_SECS", "300").parse()?,
+
+            max_message_size: env_or("MAX_MESSAGE_SIZE", "52428800").parse()?, // 50MB
+            max_retries: env_or("MAX_RETRIES", "5").parse()?,
+
+            encryption_master_key: env_opt("ENCRYPTION_MASTER_KEY"),
         })
+    }
+
+    /// Returns true if TLS cert and key paths are both configured.
+    pub fn tls_configured(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
+
+    /// Validate configuration at startup. Catches misconfigurations early
+    /// with clear error messages instead of cryptic runtime failures.
+    pub fn validate(&self) -> Result<()> {
+        // JWT secret must be reasonably strong
+        if self.jwt_secret.len() < 16 {
+            anyhow::bail!("JWT_SECRET must be at least 16 characters");
+        }
+
+        // TLS: if one path is set, both must be set
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            anyhow::bail!("TLS_CERT_PATH and TLS_KEY_PATH must both be set or both be unset");
+        }
+
+        // TLS: verify files exist if paths given
+        if let Some(ref path) = self.tls_cert_path {
+            if !path.exists() {
+                anyhow::bail!("TLS_CERT_PATH does not exist: {:?}", path);
+            }
+        }
+        if let Some(ref path) = self.tls_key_path {
+            if !path.exists() {
+                anyhow::bail!("TLS_KEY_PATH does not exist: {:?}", path);
+            }
+        }
+
+        // Encryption master key: if set, must be valid 32-byte hex
+        if let Some(ref key) = self.encryption_master_key {
+            let bytes = hex::decode(key)
+                .map_err(|_| anyhow::anyhow!("ENCRYPTION_MASTER_KEY must be valid hex"))?;
+            if bytes.len() != 32 {
+                anyhow::bail!("ENCRYPTION_MASTER_KEY must be exactly 32 bytes (64 hex chars), got {}", bytes.len());
+            }
+        }
+
+        // FCM key file: verify exists if path given
+        if let Some(ref path) = self.fcm_key_path {
+            if !path.exists() {
+                anyhow::bail!("FCM_SERVICE_ACCOUNT_KEY does not exist: {:?}", path);
+            }
+        }
+
+        // Max message size: sanity check
+        if self.max_message_size == 0 {
+            anyhow::bail!("MAX_MESSAGE_SIZE must be > 0");
+        }
+
+        Ok(())
     }
 
     pub fn database_url(&self) -> String {

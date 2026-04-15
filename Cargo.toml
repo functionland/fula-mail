@@ -14,10 +14,14 @@ mail-auth = "0.4"
 
 # Web framework (same as fula-gateway)
 axum = { version = "0.8", features = ["macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower_governor = "0.8"
+governor = "0.10"
 hyper = { version = "1.5", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 # Encryption (fula-client compatible: Ed25519 -> X25519, NaCl box)
 crypto_box = { version = "0.9", features = ["seal"] }
@@ -29,6 +33,9 @@ rand = "0.8"
 # Hashing (same as fula-gateway)
 blake3 = "1.5"
 sha2 = "0.10"
+
+# Envelope encryption for secrets at rest (DKIM keys, relay API keys)
+aes-gcm = "0.10"
 
 # Database (shared PostgreSQL)
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
