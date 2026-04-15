@@ -18,11 +18,12 @@ use crate::{crypto, server::AppState};
 ///
 /// Failed entries are retried up to max_retries times, then marked permanently_failed.
 pub async fn run_expiry_worker(state: Arc<AppState>) -> anyhow::Result<()> {
-    tracing::info!("Path A expiry worker started (TTL: {}s, max_retries: {})",
-        state.config.path_a_ttl_secs, state.config.max_retries);
+    let poll_secs = state.config.expiry_poll_secs;
+    tracing::info!("Path A expiry worker started (TTL: {}s, max_retries: {}, poll_interval: {}s)",
+        state.config.path_a_ttl_secs, state.config.max_retries, poll_secs);
 
     loop {
-        sleep(Duration::from_secs(30)).await;
+        sleep(Duration::from_secs(poll_secs)).await;
 
         match process_expired(&state).await {
             Ok(count) if count > 0 => {
@@ -37,7 +38,10 @@ pub async fn run_expiry_worker(state: Arc<AppState>) -> anyhow::Result<()> {
 }
 
 async fn process_expired(state: &AppState) -> anyhow::Result<usize> {
-    let expired = state.db.get_expired_pending(state.config.max_retries).await?;
+    // C3: Atomic claim — prevents TOCTOU race with client pickup (claim_queue_entry).
+    // Entries are set to 'expiry_processing' atomically, so claim_queue_entry
+    // (which requires status='pending') will correctly fail for already-claimed entries.
+    let expired = state.db.claim_expired_batch(state.config.max_retries, 20).await?;
     let mut count = 0;
 
     for entry in expired {

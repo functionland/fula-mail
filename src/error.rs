@@ -45,6 +45,9 @@ pub enum MailError {
     #[error("Message too large")]
     MessageTooLarge,
 
+    #[error("Resource limit: {0}")]
+    ResourceLimit(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -54,17 +57,29 @@ pub enum MailError {
 
 impl IntoResponse for MailError {
     fn into_response(self) -> axum::response::Response {
+        // Log full details server-side; return generic messages to clients (H10).
         let (status, message) = match &self {
-            MailError::DomainNotFound(_) | MailError::AddressNotFound(_) | MailError::QueueNotFound(_) => {
-                (StatusCode::NOT_FOUND, self.to_string())
+            MailError::DomainNotFound(d) => {
+                tracing::warn!("Domain not found: {}", d);
+                (StatusCode::NOT_FOUND, "Not found".to_string())
             }
-            MailError::DomainNotVerified(_) => (StatusCode::PRECONDITION_FAILED, self.to_string()),
-            MailError::AddressExists(_) => (StatusCode::CONFLICT, self.to_string()),
-            MailError::InvalidPeerId(_) | MailError::InvalidInput(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            MailError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
-            MailError::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
-            MailError::QueueExpired => (StatusCode::GONE, self.to_string()),
-            MailError::MessageTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
+            MailError::AddressNotFound(a) => {
+                tracing::warn!("Address not found: {}", a);
+                (StatusCode::NOT_FOUND, "Not found".to_string())
+            }
+            MailError::QueueNotFound(q) => {
+                tracing::warn!("Queue entry not found: {}", q);
+                (StatusCode::NOT_FOUND, "Not found".to_string())
+            }
+            MailError::DomainNotVerified(_) => (StatusCode::PRECONDITION_FAILED, "Domain not verified".to_string()),
+            MailError::AddressExists(_) => (StatusCode::CONFLICT, "Address already exists".to_string()),
+            MailError::InvalidPeerId(_) => (StatusCode::BAD_REQUEST, "Invalid peer ID".to_string()),
+            MailError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            MailError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            MailError::Forbidden(_) => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
+            MailError::QueueExpired => (StatusCode::GONE, "Queue entry expired".to_string()),
+            MailError::MessageTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Message too large".to_string()),
+            MailError::ResourceLimit(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             _ => {
                 tracing::error!("Internal error: {}", self);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())

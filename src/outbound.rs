@@ -56,12 +56,14 @@ pub async fn enqueue_outbound(
 }
 
 /// Background worker that processes the outbound mail queue.
-/// Runs every 10 seconds, claims a batch of pending messages, and delivers them.
+/// Poll interval is configurable via OUTBOUND_POLL_SECS (default 10s).
 pub async fn run_outbound_worker(state: Arc<AppState>) -> anyhow::Result<()> {
-    tracing::info!("Outbound delivery worker started (max_retries: {})", MAX_OUTBOUND_RETRIES);
+    let poll_secs = state.config.outbound_poll_secs;
+    tracing::info!("Outbound delivery worker started (max_retries: {}, poll_interval: {}s)",
+        MAX_OUTBOUND_RETRIES, poll_secs);
 
     loop {
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(poll_secs)).await;
 
         match process_outbound_batch(&state).await {
             Ok(count) if count > 0 => {
@@ -134,6 +136,9 @@ async fn deliver_one(
         anyhow::bail!("Sender domain not active (permanent)");
     }
 
+    // H8: Decrypt body (encrypted at rest in outbound queue)
+    let body = db.decrypt_outbound_body(&entry.body)?;
+
     // Build the email message
     let mut email_builder = Message::builder()
         .from(entry.sender.parse()?)
@@ -145,10 +150,10 @@ async fn deliver_one(
 
     let mut email = if entry.content_type.contains("html") {
         email_builder.header(ContentType::TEXT_HTML)
-            .body(entry.body.clone())?
+            .body(body)?
     } else {
         email_builder.header(ContentType::TEXT_PLAIN)
-            .body(entry.body.clone())?
+            .body(body)?
     };
 
     // DKIM sign the message using domain's private key (PKCS#1 PEM)
@@ -220,47 +225,14 @@ async fn relay_via_provider(relay: &RelayConfig, email: &Message) -> Result<Stri
     }
 }
 
-/// Send via SendGrid Web API v3.
+/// Send via SendGrid SMTP relay (C2 fix).
+///
+/// Uses SendGrid's SMTP endpoint instead of the Web API. This correctly sends
+/// the full DKIM-signed MIME message rather than constructing a separate payload
+/// that would discard the DKIM signature and message body.
 async fn relay_sendgrid(api_key: &str, email: &Message) -> Result<String> {
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .post("https://api.sendgrid.com/v3/mail/send")
-        .bearer_auth(api_key)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "personalizations": [{
-                "to": email.envelope().to().iter().map(|a| {
-                    serde_json::json!({ "email": a.to_string() })
-                }).collect::<Vec<_>>(),
-            }],
-            "from": { "email": email.envelope().from().map(|f| f.to_string()).unwrap_or_default() },
-            "content": [{
-                "type": "text/plain",
-                "value": " " // placeholder — raw content below overrides
-            }],
-        }))
-        .send()
-        .await?;
-
-    if resp.status().is_success() || resp.status().as_u16() == 202 {
-        let msg_id = resp.headers()
-            .get("x-message-id")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("sendgrid-accepted")
-            .to_string();
-        Ok(msg_id)
-    } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        // 4xx from SendGrid = usually auth/validation issue (permanent)
-        // 5xx = server error (transient)
-        if status.as_u16() >= 500 {
-            anyhow::bail!("SendGrid server error ({}): {}", status, body)
-        } else {
-            anyhow::bail!("SendGrid API error ({}) (permanent): {}", status, body)
-        }
-    }
+    // SendGrid SMTP: authenticate with "apikey" as username and the API key as password
+    relay_smtp("smtp.sendgrid.net", 587, "apikey", api_key, email).await
 }
 
 /// Send via Mailgun SMTP relay.

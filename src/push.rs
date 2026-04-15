@@ -10,6 +10,16 @@
 use anyhow::Result;
 use serde::Deserialize;
 
+/// Result of a push notification attempt (M6).
+pub enum PushResult {
+    /// Push sent successfully.
+    Sent,
+    /// Push skipped (platform not configured or not supported).
+    Skipped,
+    /// Push token is invalid/stale — caller should clear it from DB.
+    TokenInvalid,
+}
+
 /// FCM push notification client using HTTP v1 API.
 /// Requires a Google service account key JSON file.
 pub struct PushClient {
@@ -79,6 +89,7 @@ impl PushClient {
 
     /// Send a push notification for new mail arrival.
     /// The notification contains the queue_id so the client can fetch the message.
+    /// Returns Ok(true) if sent, Ok(false) if skipped, Err if token is stale (M6: caller should clear it).
     pub async fn notify_new_mail(
         &self,
         push_token: &str,
@@ -86,16 +97,16 @@ impl PushClient {
         queue_id: &str,
         sender: &str,
         subject: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PushResult> {
         match platform {
             "fcm" | "android" => self.send_fcm(push_token, queue_id, sender, subject).await,
             "apns" | "ios" => {
                 tracing::warn!("APNs push not yet implemented, skipping notification for queue_id={}", queue_id);
-                Ok(())
+                Ok(PushResult::Skipped)
             }
             _ => {
                 tracing::warn!("Unknown push platform '{}', skipping", platform);
-                Ok(())
+                Ok(PushResult::Skipped)
             }
         }
     }
@@ -106,12 +117,12 @@ impl PushClient {
         queue_id: &str,
         sender: &str,
         subject: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<PushResult> {
         let fcm = match &self.fcm {
             Some(f) => f,
             None => {
                 tracing::debug!("FCM not configured, skipping push");
-                return Ok(());
+                return Ok(PushResult::Skipped);
             }
         };
 
@@ -150,13 +161,24 @@ impl PushClient {
 
         if resp.status().is_success() {
             tracing::debug!("FCM push sent for queue_id={}", queue_id);
-            Ok(())
+            Ok(PushResult::Sent)
         } else {
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
-            // Don't fail the mail flow for push errors — log and continue
-            tracing::warn!("FCM push failed ({}): {}", status, err_body);
-            Ok(())
+
+            // M6: Detect stale/invalid tokens so caller can clean them up
+            let is_stale = err_body.contains("NOT_FOUND")
+                || err_body.contains("UNREGISTERED")
+                || err_body.contains("INVALID_ARGUMENT")
+                || status.as_u16() == 404;
+
+            if is_stale {
+                tracing::warn!("FCM token invalid/stale for queue_id={}: {}", queue_id, err_body);
+                Ok(PushResult::TokenInvalid)
+            } else {
+                tracing::warn!("FCM push failed ({}): {}", status, err_body);
+                Ok(PushResult::Sent) // Transient failure, don't clear token
+            }
         }
     }
 

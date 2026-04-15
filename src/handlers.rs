@@ -13,18 +13,26 @@ use crate::{auth::AuthenticatedUser, dns, error::MailError, server::AppState};
 
 // ---- Health ----
 
-/// Deep readiness probe: checks DB connectivity.
+/// Deep readiness probe: checks DB connectivity and TLS cert status (L6).
 /// Returns 200 if healthy, 503 if any dependency is down.
 pub async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Check DB connectivity
     let db_ok = state.db.health_check().await;
+
+    // L6: Check TLS cert validity if configured
+    let tls_status = if let Some(ref cert_path) = state.config.tls_cert_path {
+        if cert_path.exists() { "configured" } else { "missing" }
+    } else {
+        "not_configured"
+    };
 
     if db_ok {
         Ok(Json(serde_json::json!({
             "status": "ok",
             "db": "connected",
+            "tls": tls_status,
+            "temp_storage": state.config.temp_storage_path.exists(),
         })))
     } else {
         Err(StatusCode::SERVICE_UNAVAILABLE)
@@ -64,6 +72,18 @@ pub async fn create_domain(
     // Validate peer ID format
     crate::crypto::ed25519_pubkey_from_peer_id(owner_peer_id)
         .map_err(|e| MailError::InvalidPeerId(e.to_string()))?;
+
+    // M1: Validate domain name format
+    validate_domain_name(&req.domain)?;
+
+    // H7: Check domain limit per user
+    let domain_count = state.db.count_domains_for_peer(owner_peer_id).await
+        .map_err(|e| MailError::Internal(e))?;
+    if domain_count >= state.config.max_domains_per_user as i64 {
+        return Err(MailError::ResourceLimit(format!(
+            "Maximum {} domains per user reached", state.config.max_domains_per_user
+        )));
+    }
 
     // Generate DKIM keypair for this domain
     let (dkim_private, dkim_public) = dns::generate_dkim_keypair()?;
@@ -190,12 +210,10 @@ pub async fn create_address(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<CreateAddressRequest>,
 ) -> Result<Json<serde_json::Value>, MailError> {
-    // Validate email format: must have exactly one @
-    let parts: Vec<&str> = req.email.split('@').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(MailError::InvalidInput("Invalid email format".to_string()));
-    }
-    let domain = parts[1];
+    // M2: Validate email format
+    validate_email_address(&req.email)?;
+
+    let domain = req.email.split('@').nth(1).unwrap(); // safe after validate_email_address
 
     let domain_record = state.db.get_domain_by_name(domain).await
         .map_err(|e| MailError::Internal(e))?
@@ -208,6 +226,15 @@ pub async fn create_address(
 
     if domain_record.status != "active" {
         return Err(MailError::DomainNotVerified(domain.to_string()));
+    }
+
+    // H7: Check address limit per domain
+    let addr_count = state.db.count_addresses_for_domain(domain_record.id).await
+        .map_err(|e| MailError::Internal(e))?;
+    if addr_count >= state.config.max_addresses_per_domain as i64 {
+        return Err(MailError::ResourceLimit(format!(
+            "Maximum {} addresses per domain reached", state.config.max_addresses_per_domain
+        )));
     }
 
     let id = state.db.create_address(&req.email, domain_record.id, &user.peer_id).await
@@ -252,13 +279,22 @@ pub async fn list_pending_mail(
 
 pub async fn get_raw_mail(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(queue_id): Path<Uuid>,
 ) -> Result<axum::response::Response, MailError> {
     // Atomically claim the entry (TOCTOU fix: UPDATE...WHERE status='pending' RETURNING)
     let entry = state.db.claim_queue_entry(queue_id).await
         .map_err(|e| MailError::Internal(e))?
-        .ok_or_else(|| MailError::QueueNotFound(format!("Entry {} not found or already picked up", queue_id)))?;
+        .ok_or_else(|| MailError::QueueNotFound(queue_id.to_string()))?;
+
+    // C1: Verify the authenticated user owns this queue entry's address
+    let addr = state.db.get_address_by_email_id(entry.address_id).await
+        .map_err(|e| MailError::Internal(e))?;
+    if let Some(ref addr) = addr {
+        if addr.owner_peer_id != user.peer_id {
+            return Err(MailError::Forbidden("Not the address owner".to_string()));
+        }
+    }
 
     let data = tokio::fs::read(&entry.storage_path).await
         .map_err(|e| MailError::Internal(anyhow::anyhow!("Cannot read temp file: {}", e)))?;
@@ -272,12 +308,21 @@ pub async fn get_raw_mail(
 
 pub async fn ack_mail_pickup(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(queue_id): Path<Uuid>,
 ) -> Result<StatusCode, MailError> {
     let entry = state.db.get_queue_entry(queue_id).await
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::QueueNotFound(queue_id.to_string()))?;
+
+    // C1: Verify the authenticated user owns this queue entry's address
+    let addr = state.db.get_address_by_email_id(entry.address_id).await
+        .map_err(|e| MailError::Internal(e))?;
+    if let Some(ref addr) = addr {
+        if addr.owner_peer_id != user.peer_id {
+            return Err(MailError::Forbidden("Not the address owner".to_string()));
+        }
+    }
 
     // Entry should already be 'picked_up' from get_raw_mail's claim_queue_entry.
     // Delete temp file.
@@ -406,6 +451,15 @@ pub async fn submit_outbound(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<OutboundRequest>,
 ) -> Result<Json<serde_json::Value>, MailError> {
+    // M7: Validate all recipient addresses before enqueuing
+    if req.to.is_empty() {
+        return Err(MailError::InvalidInput("At least one recipient is required".to_string()));
+    }
+    for recipient in &req.to {
+        validate_email_address(recipient)?;
+    }
+    validate_email_address(&req.from)?;
+
     // Verify the sender address belongs to the authenticated user
     let addr = state.db.get_address_by_email(&req.from).await
         .map_err(|e| MailError::Internal(e))?
@@ -423,4 +477,51 @@ pub async fn submit_outbound(
         "status": "queued",
         "queue_id": queue_id,
     })))
+}
+
+// ---- Validation helpers (M1, M2) ----
+
+/// Validate domain name format (M1).
+fn validate_domain_name(domain: &str) -> Result<(), MailError> {
+    if domain.is_empty() || domain.len() > 253 {
+        return Err(MailError::InvalidInput("Domain name must be 1-253 characters".to_string()));
+    }
+    // Must have at least one dot (TLD)
+    if !domain.contains('.') {
+        return Err(MailError::InvalidInput("Domain must contain at least one dot".to_string()));
+    }
+    // Each label: alphanumeric + hyphens, 1-63 chars, no leading/trailing hyphen
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(MailError::InvalidInput("Domain label must be 1-63 characters".to_string()));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(MailError::InvalidInput("Domain label cannot start or end with hyphen".to_string()));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(MailError::InvalidInput("Domain label contains invalid characters".to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// Validate email address format (M2).
+fn validate_email_address(email: &str) -> Result<(), MailError> {
+    if email.len() > 254 {
+        return Err(MailError::InvalidInput("Email address too long".to_string()));
+    }
+    let parts: Vec<&str> = email.split('@').collect();
+    if parts.len() != 2 {
+        return Err(MailError::InvalidInput("Invalid email format".to_string()));
+    }
+    let local = parts[0];
+    let domain = parts[1];
+    if local.is_empty() || local.len() > 64 {
+        return Err(MailError::InvalidInput("Local part must be 1-64 characters".to_string()));
+    }
+    // Reject obviously dangerous characters in local part
+    if local.contains('\0') || local.contains('\n') || local.contains('\r') {
+        return Err(MailError::InvalidInput("Local part contains invalid characters".to_string()));
+    }
+    validate_domain_name(domain)
 }

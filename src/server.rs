@@ -9,6 +9,7 @@ use axum::{
 };
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor};
 use tower_http::cors::{CorsLayer, Any};
+use tower_http::trace::TraceLayer;
 
 use crate::{auth, config::Config, db::Database, handlers, pinning::PinningClient, push::PushClient};
 
@@ -84,11 +85,17 @@ pub async fn run_http(state: Arc<AppState>) -> anyhow::Result<()> {
         ])
         .allow_headers(Any);
 
+    // M4: Security headers middleware
+    let security_headers = axum::middleware::from_fn(add_security_headers);
+
     let app = public_routes
         .merge(protected_routes)
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(cors)
         .layer(GovernorLayer::new(governor_conf))
+        .layer(security_headers)
+        // M5: Request tracing (logs method, URI, status, latency)
+        .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
     let addr = format!("{}:{}", state.config.mail_host, state.config.mail_http_port);
@@ -108,4 +115,18 @@ pub async fn run_http(state: Arc<AppState>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// M4: Add security headers to all HTTP responses.
+async fn add_security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert("Cache-Control", "no-store".parse().unwrap());
+    headers.insert("X-Request-Id", uuid::Uuid::new_v4().to_string().parse().unwrap());
+    resp
 }

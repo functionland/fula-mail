@@ -14,9 +14,11 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
+-- Drop old constraint if it exists (missing expiry_processing status)
+ALTER TABLE mail_inbound_queue DROP CONSTRAINT IF EXISTS chk_queue_status;
 DO $$ BEGIN
     ALTER TABLE mail_inbound_queue ADD CONSTRAINT chk_queue_status
-        CHECK (status IN ('pending', 'picked_up', 'expired', 'fallback_encrypted', 'permanently_failed'));
+        CHECK (status IN ('pending', 'picked_up', 'expired', 'fallback_encrypted', 'permanently_failed', 'expiry_processing'));
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 

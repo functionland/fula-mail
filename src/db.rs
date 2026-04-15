@@ -25,13 +25,15 @@ pub struct Database {
 impl Database {
     pub async fn connect(config: &Config) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(25)
+            .max_connections(config.postgres_max_connections)
             .acquire_timeout(Duration::from_secs(30))
-            .idle_timeout(Duration::from_secs(300))
+            .idle_timeout(Duration::from_secs(config.postgres_idle_timeout_secs))
             .connect(&config.database_url())
             .await?;
 
-        tracing::info!("Connected to shared PostgreSQL at {}:{}", config.postgres_host, config.postgres_port);
+        tracing::info!("Connected to shared PostgreSQL at {}:{} (max_conn={}, idle_timeout={}s)",
+            config.postgres_host, config.postgres_port,
+            config.postgres_max_connections, config.postgres_idle_timeout_secs);
         if config.encryption_master_key.is_some() {
             tracing::info!("Secret encryption at rest: ENABLED");
         } else {
@@ -159,7 +161,29 @@ impl Database {
         Ok(rows.into_iter().collect())
     }
 
+    /// Count domains owned by a peer (for H7 resource limits).
+    pub async fn count_domains_for_peer(&self, peer_id: &str) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_domains WHERE owner_peer_id = $1"
+        )
+        .bind(peer_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     // ---- Address operations ----
+
+    /// Count addresses under a domain (for H7 resource limits).
+    pub async fn count_addresses_for_domain(&self, domain_id: Uuid) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_addresses WHERE domain_id = $1"
+        )
+        .bind(domain_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
 
     pub async fn create_address(
         &self,
@@ -205,6 +229,17 @@ impl Database {
             }
             None => Ok(None),
         }
+    }
+
+    /// Look up address by ID (for ownership checks in handlers).
+    pub async fn get_address_by_email_id(&self, address_id: Uuid) -> Result<Option<AddressOwnerRecord>> {
+        let record = sqlx::query_as::<_, AddressOwnerRecord>(
+            "SELECT id, owner_peer_id FROM mail_addresses WHERE id = $1"
+        )
+        .bind(address_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
     }
 
     pub async fn update_push_token(
@@ -362,15 +397,26 @@ impl Database {
         Ok(record)
     }
 
-    /// Get expired pending entries, limited to those under max retries.
-    pub async fn get_expired_pending(&self, max_retries: i32) -> Result<Vec<InboundQueueRecord>> {
+    /// Atomically claim expired pending entries for Path B processing (C3 TOCTOU fix).
+    /// Uses UPDATE...RETURNING with FOR UPDATE SKIP LOCKED to prevent races with
+    /// client pickup (claim_queue_entry) and other expiry worker instances.
+    pub async fn claim_expired_batch(&self, max_retries: i32, limit: i64) -> Result<Vec<InboundQueueRecord>> {
         let records = sqlx::query_as::<_, InboundQueueRecord>(
-            "SELECT q.id, q.address_id, q.message_id, q.storage_path, a.owner_peer_id, q.retry_count
-             FROM mail_inbound_queue q
-             JOIN mail_addresses a ON a.id = q.address_id
-             WHERE q.status = 'pending' AND q.expires_at < NOW() AND q.retry_count < $1"
+            "UPDATE mail_inbound_queue
+             SET status = 'expiry_processing'
+             WHERE id IN (
+                 SELECT q.id FROM mail_inbound_queue q
+                 WHERE q.status = 'pending' AND q.expires_at < NOW() AND q.retry_count < $1
+                 ORDER BY q.expires_at ASC
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id, address_id, message_id, storage_path,
+                       (SELECT a.owner_peer_id FROM mail_addresses a WHERE a.id = address_id) as owner_peer_id,
+                       retry_count"
         )
         .bind(max_retries)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
@@ -424,6 +470,9 @@ impl Database {
         body: &str,
         content_type: &str,
     ) -> Result<Uuid> {
+        // H8: Encrypt body at rest so pending outbound mail isn't readable if DB is compromised
+        let encrypted_body = self.encrypt(body)?;
+
         let id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO mail_outbound_queue (address_id, sender, recipients, subject, body, content_type)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -433,12 +482,17 @@ impl Database {
         .bind(sender)
         .bind(recipients)
         .bind(subject)
-        .bind(body)
+        .bind(&encrypted_body)
         .bind(content_type)
         .fetch_one(&self.pool)
         .await?;
 
         Ok(id)
+    }
+
+    /// Decrypt outbound body when reading from queue (H8 counterpart).
+    pub fn decrypt_outbound_body(&self, encrypted_body: &str) -> Result<String> {
+        self.decrypt(encrypted_body)
     }
 
     /// Claim the next batch of outbound messages ready for delivery.
@@ -507,6 +561,76 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    // ---- Queue cleanup (H9) ----
+
+    /// Delete completed/failed queue entries older than retention_days.
+    pub async fn cleanup_old_queue_entries(&self, retention_days: i64) -> Result<(u64, u64, u64)> {
+        let inbound = sqlx::query(
+            "DELETE FROM mail_inbound_queue
+             WHERE status IN ('picked_up', 'fallback_encrypted', 'permanently_failed')
+             AND created_at < NOW() - make_interval(days => $1)"
+        )
+        .bind(retention_days as f64)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        let outbound = sqlx::query(
+            "DELETE FROM mail_outbound_queue
+             WHERE status IN ('sent', 'permanently_failed')
+             AND created_at < NOW() - make_interval(days => $1)"
+        )
+        .bind(retention_days as f64)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        let logs = sqlx::query(
+            "DELETE FROM mail_delivery_log
+             WHERE created_at < NOW() - make_interval(days => $1)"
+        )
+        .bind((retention_days * 3) as f64) // Keep logs 3x longer than queue entries
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        Ok((inbound, outbound, logs))
+    }
+
+    /// Reset any 'sending' outbound entries back to 'pending' (stuck from crashed worker).
+    /// Called on startup to recover from unclean shutdown (M8).
+    pub async fn recover_stuck_outbound(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE mail_outbound_queue SET status = 'pending', updated_at = NOW()
+             WHERE status = 'sending'"
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Reset any 'expiry_processing' inbound entries back to 'pending' (stuck from crashed worker).
+    pub async fn recover_stuck_inbound(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE mail_inbound_queue SET status = 'pending'
+             WHERE status = 'expiry_processing'"
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clear push token for an address (M6: stale FCM token cleanup).
+    pub async fn clear_push_token(&self, address_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_addresses SET push_token = NULL, push_platform = NULL WHERE id = $1"
+        )
+        .bind(address_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -676,6 +800,12 @@ pub struct InboundQueueRecord {
     pub storage_path: String,
     pub owner_peer_id: String,
     pub retry_count: i32,
+}
+
+#[derive(sqlx::FromRow, Debug)]
+pub struct AddressOwnerRecord {
+    pub id: Uuid,
+    pub owner_peer_id: String,
 }
 
 #[derive(sqlx::FromRow, Debug)]
