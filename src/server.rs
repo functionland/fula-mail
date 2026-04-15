@@ -41,6 +41,10 @@ pub async fn run_http(state: Arc<AppState>) -> anyhow::Result<()> {
         // Push notification token registration
         .route("/api/v1/push-token", put(handlers::register_push_token))
 
+        // Relay config (BYOK: user provides their own SendGrid/Mailgun/SMTP credentials)
+        .route("/api/v1/relay", post(handlers::set_relay_config))
+        .route("/api/v1/relay/{email}", get(handlers::get_relay_config).delete(handlers::delete_relay_config))
+
         // Outbound: client submits plaintext for SMTP relay
         .route("/api/v1/outbound/send", post(handlers::submit_outbound))
 

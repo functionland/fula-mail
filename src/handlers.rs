@@ -74,16 +74,29 @@ pub async fn get_domain(
 ) -> Result<Json<serde_json::Value>, MailError> {
     let record = state.db.get_domain_by_name(&domain).await
         .map_err(|e| MailError::Internal(e))?
-        .ok_or_else(|| MailError::DomainNotFound(domain))?;
+        .ok_or_else(|| MailError::DomainNotFound(domain.clone()))?;
+
+    // Always check DNS live — no cached flags
+    let verification = dns::verify_domain_dns(&domain, &state.config.mx_hostname, &record.dkim_public_key, &record.dkim_selector).await
+        .unwrap_or(dns::DnsVerification { mx: false, spf: false, dkim: false, dmarc: false });
+
+    let live_status = if verification.mx && verification.spf && verification.dkim { "active" } else { "pending_verification" };
+
+    // Update stored status if it changed (so SMTP inbound can fast-check without DNS)
+    if record.status != live_status {
+        let _ = state.db.update_domain_verification(
+            record.id, verification.mx, verification.spf, verification.dkim, verification.dmarc,
+        ).await;
+    }
 
     Ok(Json(serde_json::json!({
         "id": record.id,
         "domain": record.domain,
-        "status": record.status,
-        "mx_verified": record.mx_verified,
-        "spf_verified": record.spf_verified,
-        "dkim_verified": record.dkim_verified,
-        "dmarc_verified": record.dmarc_verified,
+        "status": live_status,
+        "mx_verified": verification.mx,
+        "spf_verified": verification.spf,
+        "dkim_verified": verification.dkim,
+        "dmarc_verified": verification.dmarc,
     })))
 }
 
@@ -95,9 +108,13 @@ pub async fn verify_domain(
         .map_err(|e| MailError::Internal(e))?
         .ok_or_else(|| MailError::DomainNotFound(domain.clone()))?;
 
+    // Always real-time DNS check
     let verification = dns::verify_domain_dns(&domain, &state.config.mx_hostname, &record.dkim_public_key, &record.dkim_selector).await
         .map_err(|e| MailError::DnsError(e.to_string()))?;
 
+    let status = if verification.mx && verification.spf && verification.dkim { "active" } else { "pending_verification" };
+
+    // Persist the result so SMTP inbound can fast-check domain_status without DNS lookup
     state.db.update_domain_verification(
         record.id,
         verification.mx,
@@ -112,7 +129,7 @@ pub async fn verify_domain(
         "spf_verified": verification.spf,
         "dkim_verified": verification.dkim,
         "dmarc_verified": verification.dmarc,
-        "status": if verification.mx && verification.spf && verification.dkim { "active" } else { "pending_verification" },
+        "status": status,
     })))
 }
 
@@ -261,6 +278,64 @@ pub async fn register_push_token(
         .map_err(|e| MailError::Internal(e))?;
 
     Ok(StatusCode::OK)
+}
+
+// ---- Relay config (BYOK: SendGrid, Mailgun, SMTP) ----
+
+pub async fn set_relay_config(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetRelayConfigRequest>,
+) -> Result<Json<serde_json::Value>, MailError> {
+    // Verify address exists
+    state.db.get_address_by_email(&req.email).await
+        .map_err(|e| MailError::Internal(e))?
+        .ok_or_else(|| MailError::AddressNotFound(req.email.clone()))?;
+
+    state.db.set_relay_config(&req.email, &req.relay).await
+        .map_err(|e| MailError::Internal(e))?;
+
+    tracing::info!("Relay config set for {}: {:?}", req.email, req.relay);
+    Ok(Json(serde_json::json!({
+        "email": req.email,
+        "provider": match &req.relay {
+            crate::db::RelayConfig::SendGrid { .. } => "sendgrid",
+            crate::db::RelayConfig::Mailgun { .. } => "mailgun",
+            crate::db::RelayConfig::Smtp { .. } => "smtp",
+        },
+        "status": "configured",
+    })))
+}
+
+pub async fn get_relay_config(
+    State(state): State<Arc<AppState>>,
+    Path(email): Path<String>,
+) -> Result<Json<serde_json::Value>, MailError> {
+    let addr = state.db.get_address_by_email(&email).await
+        .map_err(|e| MailError::Internal(e))?
+        .ok_or_else(|| MailError::AddressNotFound(email.clone()))?;
+
+    let relay = addr.relay_config();
+    Ok(Json(serde_json::json!({
+        "email": email,
+        "configured": relay.is_some(),
+        "provider": addr.relay_provider,
+    })))
+}
+
+pub async fn delete_relay_config(
+    State(state): State<Arc<AppState>>,
+    Path(email): Path<String>,
+) -> Result<StatusCode, MailError> {
+    state.db.clear_relay_config(&email).await
+        .map_err(|e| MailError::Internal(e))?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct SetRelayConfigRequest {
+    pub email: String,
+    #[serde(flatten)]
+    pub relay: crate::db::RelayConfig,
 }
 
 // ---- Outbound ----

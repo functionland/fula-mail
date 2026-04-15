@@ -29,8 +29,12 @@ impl Database {
     pub async fn run_migrations(&self) -> Result<()> {
         // Run email-specific migrations only.
         // Pinning-service migrations are managed by pinning-service's deploy.sh.
-        let migration_sql = include_str!("../migrations/postgres/001_mail_schema.sql");
-        sqlx::raw_sql(migration_sql).execute(&self.pool).await?;
+        let migration_001 = include_str!("../migrations/postgres/001_mail_schema.sql");
+        sqlx::raw_sql(migration_001).execute(&self.pool).await?;
+
+        let migration_002 = include_str!("../migrations/postgres/002_relay_config.sql");
+        sqlx::raw_sql(migration_002).execute(&self.pool).await?;
+
         tracing::info!("Email migrations applied");
         Ok(())
     }
@@ -124,6 +128,8 @@ impl Database {
     pub async fn get_address_by_email(&self, email: &str) -> Result<Option<AddressRecord>> {
         let record = sqlx::query_as::<_, AddressRecord>(
             "SELECT a.id, a.email, a.domain_id, a.owner_peer_id, a.push_token, a.push_platform,
+                    a.relay_provider, a.relay_api_key, a.relay_smtp_host, a.relay_smtp_port,
+                    a.relay_smtp_user, a.relay_mailgun_domain,
                     d.domain, d.dkim_private_key, d.dkim_selector, d.status as domain_status
              FROM mail_addresses a
              JOIN mail_domains d ON d.id = a.domain_id
@@ -148,6 +154,67 @@ impl Database {
         .bind(address_id)
         .bind(token)
         .bind(platform)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ---- Relay config (BYOK: SendGrid, Mailgun, SMTP) ----
+
+    pub async fn set_relay_config(&self, email: &str, config: &RelayConfig) -> Result<()> {
+        match config {
+            RelayConfig::SendGrid { api_key } => {
+                sqlx::query(
+                    "UPDATE mail_addresses SET relay_provider = 'sendgrid', relay_api_key = $2,
+                     relay_smtp_host = NULL, relay_smtp_port = NULL, relay_smtp_user = NULL, relay_mailgun_domain = NULL
+                     WHERE email = $1"
+                )
+                .bind(email)
+                .bind(api_key)
+                .execute(&self.pool)
+                .await?;
+            }
+            RelayConfig::Mailgun { api_key, domain } => {
+                sqlx::query(
+                    "UPDATE mail_addresses SET relay_provider = 'mailgun', relay_api_key = $2,
+                     relay_mailgun_domain = $3,
+                     relay_smtp_host = NULL, relay_smtp_port = NULL, relay_smtp_user = NULL
+                     WHERE email = $1"
+                )
+                .bind(email)
+                .bind(api_key)
+                .bind(domain)
+                .execute(&self.pool)
+                .await?;
+            }
+            RelayConfig::Smtp { host, port, username, password } => {
+                sqlx::query(
+                    "UPDATE mail_addresses SET relay_provider = 'smtp', relay_api_key = $2,
+                     relay_smtp_host = $3, relay_smtp_port = $4, relay_smtp_user = $5,
+                     relay_mailgun_domain = NULL
+                     WHERE email = $1"
+                )
+                .bind(email)
+                .bind(password)
+                .bind(host)
+                .bind(*port as i32)
+                .bind(username)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn clear_relay_config(&self, email: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE mail_addresses SET relay_provider = NULL, relay_api_key = NULL,
+             relay_smtp_host = NULL, relay_smtp_port = NULL, relay_smtp_user = NULL, relay_mailgun_domain = NULL
+             WHERE email = $1"
+        )
+        .bind(email)
         .execute(&self.pool)
         .await?;
 
@@ -304,10 +371,50 @@ pub struct AddressRecord {
     pub owner_peer_id: String,
     pub push_token: Option<String>,
     pub push_platform: Option<String>,
+    // Relay config (BYOK)
+    pub relay_provider: Option<String>,
+    pub relay_api_key: Option<String>,
+    pub relay_smtp_host: Option<String>,
+    pub relay_smtp_port: Option<i32>,
+    pub relay_smtp_user: Option<String>,
+    pub relay_mailgun_domain: Option<String>,
+    // Joined from domain
     pub domain: String,
     pub dkim_private_key: String,
     pub dkim_selector: String,
     pub domain_status: String,
+}
+
+impl AddressRecord {
+    /// Build a RelayConfig from the stored fields, if a relay is configured.
+    pub fn relay_config(&self) -> Option<RelayConfig> {
+        match self.relay_provider.as_deref() {
+            Some("sendgrid") => Some(RelayConfig::SendGrid {
+                api_key: self.relay_api_key.clone()?,
+            }),
+            Some("mailgun") => Some(RelayConfig::Mailgun {
+                api_key: self.relay_api_key.clone()?,
+                domain: self.relay_mailgun_domain.clone()?,
+            }),
+            Some("smtp") => Some(RelayConfig::Smtp {
+                host: self.relay_smtp_host.clone()?,
+                port: self.relay_smtp_port.unwrap_or(587) as u16,
+                username: self.relay_smtp_user.clone().unwrap_or_default(),
+                password: self.relay_api_key.clone()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// User's outbound relay configuration.
+/// Users bring their own API key — no IP warming needed for the gateway.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum RelayConfig {
+    SendGrid { api_key: String },
+    Mailgun { api_key: String, domain: String },
+    Smtp { host: String, port: u16, username: String, password: String },
 }
 
 #[derive(sqlx::FromRow, Debug)]

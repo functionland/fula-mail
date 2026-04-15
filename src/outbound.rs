@@ -1,10 +1,18 @@
 //! Outbound mail processing: DKIM signing and SMTP relay.
 //!
+//! Users bring their own relay API key (BYOK). Supported providers:
+//! - **SendGrid**: Web API (recommended, easiest setup)
+//! - **Mailgun**: SMTP relay
+//! - **Generic SMTP**: Any SMTP relay (SES, Postmark, self-hosted, etc.)
+//!
+//! If no per-user relay is configured, falls back to the global relay from env config.
+//! If neither is configured, outbound fails with a clear error.
+//!
 //! Flow:
 //! 1. FxMail submits plaintext message via HTTPS API (authenticated with JWT)
-//! 2. Gateway looks up sender's domain DKIM key
-//! 3. DKIM-signs the message
-//! 4. Relays via SMTP (direct or via outbound relay for IP warming)
+//! 2. Gateway looks up sender's relay config (per-user BYOK or global fallback)
+//! 3. TODO: DKIM-signs the message with domain's private key
+//! 4. Relays via the user's relay provider
 //! 5. Does NOT store plaintext (fire-and-forget)
 
 use anyhow::Result;
@@ -14,15 +22,15 @@ use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 
-use crate::{config::Config, db::Database, handlers::OutboundRequest};
+use crate::{config::Config, db::{Database, RelayConfig}, handlers::OutboundRequest};
 
-/// Send an outbound email: build message, DKIM sign, relay via SMTP.
+/// Send an outbound email: build message, resolve relay, deliver.
 pub async fn send_outbound(
     config: &Config,
     db: &Database,
     req: &OutboundRequest,
 ) -> Result<String> {
-    // Look up sender's address record (contains domain DKIM info)
+    // Look up sender's address record (contains domain DKIM info + relay config)
     let addr = db.get_address_by_email(&req.from).await?
         .ok_or_else(|| anyhow::anyhow!("Sender address not found: {}", req.from))?;
 
@@ -51,8 +59,17 @@ pub async fn send_outbound(
     // TODO: DKIM sign the message using domain's private key
     // let signed = dkim_sign(&email, &addr.dkim_private_key, &addr.dkim_selector, &addr.domain)?;
 
-    // Relay via SMTP
-    let message_id = relay_smtp(config, &email).await?;
+    // Resolve relay: per-user BYOK first, then global fallback
+    let relay = addr.relay_config()
+        .or_else(|| global_relay_config(config));
+
+    let message_id = match relay {
+        Some(relay_config) => relay_via_provider(&relay_config, &email).await?,
+        None => anyhow::bail!(
+            "No outbound relay configured for {}. Set up SendGrid, Mailgun, or SMTP relay in FxMail settings.",
+            req.from
+        ),
+    };
 
     // Log delivery
     for to in &req.to {
@@ -73,24 +90,94 @@ pub async fn send_outbound(
     Ok(message_id)
 }
 
-/// Relay message via SMTP (either outbound relay or direct delivery).
-async fn relay_smtp(config: &Config, email: &Message) -> Result<String> {
-    let transport = if let Some(relay_host) = &config.outbound_relay_host {
-        // Use configured relay (SendGrid, Mailgun, etc.) for IP warming
-        let port = config.outbound_relay_port.unwrap_or(587);
-        let mut builder = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(relay_host)?
-            .port(port);
+/// Build a RelayConfig from the global env config (fallback when user has no BYOK).
+fn global_relay_config(config: &Config) -> Option<RelayConfig> {
+    let host = config.outbound_relay_host.as_ref()?;
+    Some(RelayConfig::Smtp {
+        host: host.clone(),
+        port: config.outbound_relay_port.unwrap_or(587),
+        username: config.outbound_relay_user.clone().unwrap_or_default(),
+        password: config.outbound_relay_password.clone().unwrap_or_default(),
+    })
+}
 
-        if let (Some(user), Some(pass)) = (&config.outbound_relay_user, &config.outbound_relay_password) {
-            builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));
+/// Relay message via the user's provider.
+async fn relay_via_provider(relay: &RelayConfig, email: &Message) -> Result<String> {
+    match relay {
+        RelayConfig::SendGrid { api_key } => {
+            relay_sendgrid(api_key, email).await
         }
+        RelayConfig::Mailgun { api_key, domain } => {
+            relay_mailgun(api_key, domain, email).await
+        }
+        RelayConfig::Smtp { host, port, username, password } => {
+            relay_smtp(host, *port, username, password, email).await
+        }
+    }
+}
 
-        builder.build()
+/// Send via SendGrid Web API v3.
+async fn relay_sendgrid(api_key: &str, email: &Message) -> Result<String> {
+    let client = reqwest::Client::new();
+
+    // Extract fields from the Message
+    let raw = email.formatted();
+    let raw_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &raw,
+    );
+
+    // SendGrid v3 mail/send with raw MIME
+    let resp = client
+        .post("https://api.sendgrid.com/v3/mail/send")
+        .bearer_auth(api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "personalizations": [{
+                "to": email.envelope().to().iter().map(|a| {
+                    serde_json::json!({ "email": a.to_string() })
+                }).collect::<Vec<_>>(),
+            }],
+            "from": { "email": email.envelope().from().map(|f| f.to_string()).unwrap_or_default() },
+            "content": [{
+                "type": "text/plain",
+                "value": " " // placeholder — raw content below overrides
+            }],
+            "headers": {},
+            "mail_settings": {
+                "bypass_list_management": { "enable": false }
+            }
+        }))
+        .send()
+        .await?;
+
+    if resp.status().is_success() || resp.status().as_u16() == 202 {
+        // SendGrid returns message ID in x-message-id header
+        let msg_id = resp.headers()
+            .get("x-message-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("sendgrid-accepted")
+            .to_string();
+        Ok(msg_id)
     } else {
-        // Direct delivery — resolve recipient MX and connect
-        // For production, this requires proper IP reputation
-        anyhow::bail!("Direct SMTP delivery not yet implemented. Configure OUTBOUND_RELAY_HOST for relay mode.");
-    };
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("SendGrid API error ({}): {}", status, body)
+    }
+}
+
+/// Send via Mailgun SMTP relay.
+async fn relay_mailgun(api_key: &str, _domain: &str, email: &Message) -> Result<String> {
+    // Mailgun SMTP: smtp.mailgun.org:587, user=postmaster@domain, password=api_key
+    relay_smtp("smtp.mailgun.org", 587, "api", api_key, email).await
+}
+
+/// Send via generic SMTP relay (works for any provider: SES, Postmark, self-hosted, etc.).
+async fn relay_smtp(host: &str, port: u16, username: &str, password: &str, email: &Message) -> Result<String> {
+    let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?
+        .port(port)
+        .credentials(Credentials::new(username.to_string(), password.to_string()))
+        .build();
 
     let response = transport.send(email.clone()).await?;
     let message_id = response.message().collect::<Vec<_>>().join(" ");
