@@ -37,6 +37,8 @@ readonly MIGRATIONS_DIR="${INSTALL_DIR}/migrations/postgres"
 readonly TEMP_DIR="${INSTALL_DIR}/.install-tmp"
 readonly MAIL_DATA_DIR="/var/lib/fula-mail"
 readonly MAIL_USER="fulamail"
+readonly NGINX_SITE_FILE="/etc/nginx/sites-available/${SERVICE_NAME}"
+readonly NGINX_SITE_LINK="/etc/nginx/sites-enabled/${SERVICE_NAME}"
 
 # Ports
 readonly DEFAULT_HTTP_PORT=8080
@@ -240,6 +242,11 @@ ENCRYPTION_MASTER_KEY="${CFG_ENCRYPTION_MASTER_KEY}"
 
 # Logging
 RUST_LOG="${CFG_RUST_LOG}"
+
+# Installer settings (used on re-run to pre-fill choices)
+CFG_SETUP_NGINX="${CFG_SETUP_NGINX}"
+CFG_SETUP_CERTBOT="${CFG_SETUP_CERTBOT}"
+CFG_CERTBOT_EMAIL="${CFG_CERTBOT_EMAIL:-}"
 ENVEOF
 
     # Secure permissions before moving into place (contains secrets)
@@ -373,19 +380,57 @@ collect_config() {
     prompt_with_default CFG_PINNING_SYSTEM_KEY  "Pinning system key"  "" "true"
     echo ""
 
-    # ---- TLS (optional) ----
-    echo -e "${CYAN}-- TLS (optional — leave empty to skip) --${NC}"
-    prompt_with_default CFG_TLS_CERT_PATH  "TLS certificate path"  ""
-    prompt_with_default CFG_TLS_KEY_PATH   "TLS private key path"  ""
-    prompt_with_default CFG_TLS_CHAIN_PATH "TLS chain path"        ""
-
-    # Validate TLS paths if provided
-    if [ -n "$CFG_TLS_CERT_PATH" ] && [ ! -f "$CFG_TLS_CERT_PATH" ]; then
-        log_warn "TLS cert file does not exist yet: ${CFG_TLS_CERT_PATH}"
-        log_warn "Make sure it exists before starting the service."
+    # ---- Nginx & TLS ----
+    echo -e "${CYAN}-- Nginx Reverse Proxy & TLS --${NC}"
+    echo "  Nginx proxies the HTTP API on ports 80/443."
+    echo "  Certbot (Let's Encrypt) obtains the SSL certificate."
+    echo "  The same cert is reused for SMTP STARTTLS."
+    prompt_with_default CFG_SETUP_NGINX "Set up nginx reverse proxy? (yes/no)" "yes"
+    if [[ "$CFG_SETUP_NGINX" =~ ^[Yy] ]]; then
+        CFG_SETUP_NGINX="yes"
+        prompt_with_default CFG_SETUP_CERTBOT "Set up SSL with certbot? (yes/no)" "yes"
+        if [[ "$CFG_SETUP_CERTBOT" =~ ^[Yy] ]]; then
+            CFG_SETUP_CERTBOT="yes"
+            prompt_required CFG_CERTBOT_EMAIL "Email for Let's Encrypt notifications" ""
+        else
+            CFG_SETUP_CERTBOT="no"
+        fi
+    else
+        CFG_SETUP_NGINX="no"
+        CFG_SETUP_CERTBOT="no"
     fi
-    if [ -n "$CFG_TLS_KEY_PATH" ] && [ ! -f "$CFG_TLS_KEY_PATH" ]; then
-        log_warn "TLS key file does not exist yet: ${CFG_TLS_KEY_PATH}"
+
+    # If certbot was already run, certs exist at well-known paths.
+    # Pre-fill TLS paths from existing .env or from certbot default location.
+    local le_cert="/etc/letsencrypt/live/${CFG_MX_HOSTNAME}/fullchain.pem"
+    local le_key="/etc/letsencrypt/live/${CFG_MX_HOSTNAME}/privkey.pem"
+    local le_chain="/etc/letsencrypt/live/${CFG_MX_HOSTNAME}/chain.pem"
+
+    # Default: if certbot certs already exist, use them. Otherwise empty (filled after certbot runs).
+    local default_cert="" default_key="" default_chain=""
+    if [ -f "$le_cert" ]; then default_cert="$le_cert"; fi
+    if [ -f "$le_key" ]; then default_key="$le_key"; fi
+    if [ -f "$le_chain" ]; then default_chain="$le_chain"; fi
+
+    # Only ask for manual TLS paths if user opted out of certbot
+    if [ "$CFG_SETUP_CERTBOT" != "yes" ]; then
+        echo ""
+        echo -e "${CYAN}-- TLS (manual — leave empty to skip) --${NC}"
+        prompt_with_default CFG_TLS_CERT_PATH  "TLS certificate path"  "$default_cert"
+        prompt_with_default CFG_TLS_KEY_PATH   "TLS private key path"  "$default_key"
+        prompt_with_default CFG_TLS_CHAIN_PATH "TLS chain path"        "$default_chain"
+
+        if [ -n "$CFG_TLS_CERT_PATH" ] && [ ! -f "$CFG_TLS_CERT_PATH" ]; then
+            log_warn "TLS cert file does not exist yet: ${CFG_TLS_CERT_PATH}"
+        fi
+        if [ -n "$CFG_TLS_KEY_PATH" ] && [ ! -f "$CFG_TLS_KEY_PATH" ]; then
+            log_warn "TLS key file does not exist yet: ${CFG_TLS_KEY_PATH}"
+        fi
+    else
+        # Will be filled after certbot runs
+        CFG_TLS_CERT_PATH="${default_cert}"
+        CFG_TLS_KEY_PATH="${default_key}"
+        CFG_TLS_CHAIN_PATH="${default_chain}"
     fi
     echo ""
 
@@ -774,6 +819,254 @@ set_permissions() {
 }
 
 # ============================================
+# Nginx reverse proxy
+# ============================================
+setup_nginx() {
+    INSTALL_PHASE="nginx setup"
+
+    if [ "${CFG_SETUP_NGINX}" != "yes" ]; then
+        log "Nginx setup skipped (user opted out)"
+        return
+    fi
+
+    # Install nginx if not present
+    if ! command -v nginx &>/dev/null; then
+        log "Installing nginx..."
+        apt-get update -qq || die "Failed to update package lists"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx || die "Failed to install nginx"
+        log "Nginx installed"
+    else
+        log "Nginx already installed: $(nginx -v 2>&1)"
+    fi
+
+    # Ensure nginx is enabled
+    systemctl enable nginx 2>/dev/null || true
+
+    local server_name="${CFG_MX_HOSTNAME}"
+    local upstream_port="${CFG_MAIL_HTTP_PORT}"
+
+    # Check if nginx config already exists for this domain
+    if [ -f "$NGINX_SITE_FILE" ]; then
+        # Check if the upstream port matches
+        if grep -q "proxy_pass http://127.0.0.1:${upstream_port}" "$NGINX_SITE_FILE"; then
+            log "Nginx site config already exists and is current"
+            # Still ensure it's enabled and nginx is reloaded
+            if [ ! -L "$NGINX_SITE_LINK" ]; then
+                ln -sf "$NGINX_SITE_FILE" "$NGINX_SITE_LINK"
+            fi
+            nginx -t 2>&1 | tee -a "$LOG_FILE" || die "Nginx config test failed"
+            systemctl reload nginx || die "Failed to reload nginx"
+            return
+        else
+            log "Nginx site config exists but upstream port changed — updating"
+        fi
+    fi
+
+    log "Creating nginx site config for ${server_name}..."
+
+    # Remove default site if it conflicts on port 80
+    if [ -L /etc/nginx/sites-enabled/default ]; then
+        rm -f /etc/nginx/sites-enabled/default
+        log "Disabled default nginx site"
+    fi
+
+    # Write HTTP-only config (certbot will add the 443 section later)
+    cat > "$NGINX_SITE_FILE" <<NGINXEOF
+# Fula Mail — nginx reverse proxy
+# Generated by install.sh v${SCRIPT_VERSION} on $(date -Iseconds)
+# Certbot will add the SSL (port 443) server block automatically.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name};
+
+    # Let's Encrypt ACME challenge (certbot needs this on port 80)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Reverse proxy to fula-mail HTTP API
+    location / {
+        proxy_pass http://127.0.0.1:${upstream_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # Timeouts for large message uploads
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+
+        # Match fula-mail's max message size (convert bytes to MB for nginx)
+        client_max_body_size $(( CFG_MAX_MESSAGE_SIZE / 1048576 + 1 ))m;
+    }
+
+    # Health check shortcut (no buffering)
+    location = /health {
+        proxy_pass http://127.0.0.1:${upstream_port}/health;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_buffering off;
+        access_log off;
+    }
+}
+NGINXEOF
+
+    # Enable the site
+    ln -sf "$NGINX_SITE_FILE" "$NGINX_SITE_LINK"
+
+    # Test and reload
+    if ! nginx -t 2>&1 | tee -a "$LOG_FILE"; then
+        # Revert: remove the broken config
+        rm -f "$NGINX_SITE_LINK"
+        die "Nginx config test failed — site config removed. Check ${NGINX_SITE_FILE}"
+    fi
+
+    systemctl reload nginx || die "Failed to reload nginx"
+    log "Nginx configured: ${server_name} → 127.0.0.1:${upstream_port}"
+}
+
+# ============================================
+# Certbot (Let's Encrypt SSL)
+# ============================================
+setup_certbot() {
+    INSTALL_PHASE="certbot SSL"
+
+    if [ "${CFG_SETUP_CERTBOT}" != "yes" ]; then
+        log "Certbot setup skipped (user opted out)"
+        return
+    fi
+
+    if [ "${CFG_SETUP_NGINX}" != "yes" ]; then
+        log_warn "Certbot requires nginx — skipping SSL setup"
+        return
+    fi
+
+    local server_name="${CFG_MX_HOSTNAME}"
+    local le_cert="/etc/letsencrypt/live/${server_name}/fullchain.pem"
+    local le_key="/etc/letsencrypt/live/${server_name}/privkey.pem"
+    local le_chain="/etc/letsencrypt/live/${server_name}/chain.pem"
+
+    # Check if cert already exists and is valid
+    if [ -f "$le_cert" ] && [ -f "$le_key" ]; then
+        # Check expiry — renew only if within 30 days
+        local expiry_epoch
+        expiry_epoch=$(openssl x509 -in "$le_cert" -noout -enddate 2>/dev/null \
+            | sed 's/notAfter=//' | xargs -I{} date -d {} +%s 2>/dev/null || echo "0")
+        local now_epoch
+        now_epoch=$(date +%s)
+        local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+
+        if [ "$days_left" -gt 30 ]; then
+            log "SSL cert exists and valid for ${days_left} more days — skipping certbot"
+            # Ensure TLS paths are set
+            CFG_TLS_CERT_PATH="$le_cert"
+            CFG_TLS_KEY_PATH="$le_key"
+            CFG_TLS_CHAIN_PATH="$le_chain"
+            save_env
+            return
+        else
+            log "SSL cert expires in ${days_left} days — will renew"
+        fi
+    fi
+
+    # Install certbot if not present
+    if ! command -v certbot &>/dev/null; then
+        log "Installing certbot..."
+        apt-get update -qq || die "Failed to update package lists"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-nginx \
+            || die "Failed to install certbot"
+        log "Certbot installed"
+    else
+        log "Certbot already installed: $(certbot --version 2>&1)"
+    fi
+
+    # Verify port 80 is reachable by nginx (needed for ACME challenge)
+    if ! curl -sf "http://127.0.0.1/.well-known/acme-challenge/" &>/dev/null && \
+       ! curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1/" 2>/dev/null | grep -qE '^[234]'; then
+        log_warn "Nginx may not be serving port 80 yet — certbot might fail"
+        log_warn "Ensure DNS for ${server_name} points to this server's public IP"
+    fi
+
+    log "Running certbot for ${server_name}..."
+    echo ""
+    echo -e "${YELLOW}  Certbot will verify domain ownership via HTTP challenge.${NC}"
+    echo -e "${YELLOW}  Make sure DNS A/AAAA record for ${server_name} points to this server.${NC}"
+    echo ""
+
+    # Run certbot with --nginx plugin.
+    # This will:
+    # 1. Obtain the certificate via ACME HTTP-01 challenge
+    # 2. Automatically modify the nginx config to add a listen 443 ssl block
+    # 3. Add ssl_certificate and ssl_certificate_key directives
+    # 4. Set up auto-renewal via systemd timer or cron
+    if ! certbot --nginx \
+        -d "$server_name" \
+        --email "${CFG_CERTBOT_EMAIL}" \
+        --agree-tos \
+        --no-eff-email \
+        --non-interactive \
+        --redirect 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Certbot failed. Common causes:"
+        log_error "  - DNS A record for ${server_name} does not point to this server"
+        log_error "  - Port 80 is blocked by firewall"
+        log_error "  - Rate limit reached (max 5 certs per domain per week)"
+        log_warn "Continuing without SSL. Re-run install.sh later to retry."
+        return
+    fi
+
+    log "SSL certificate obtained successfully"
+
+    # Verify cert files exist
+    if [ ! -f "$le_cert" ] || [ ! -f "$le_key" ]; then
+        log_warn "Certbot succeeded but cert files not found at expected paths"
+        log_warn "Expected: ${le_cert}"
+        return
+    fi
+
+    # Update TLS paths in .env so fula-mail uses same cert for SMTP STARTTLS
+    CFG_TLS_CERT_PATH="$le_cert"
+    CFG_TLS_KEY_PATH="$le_key"
+    CFG_TLS_CHAIN_PATH="$le_chain"
+    save_env
+
+    # Grant fulamail user read access to Let's Encrypt certs
+    # Certbot stores certs readable by root only. We add the service user
+    # to a group that can traverse the directory.
+    if ! getent group letsencrypt &>/dev/null; then
+        groupadd letsencrypt 2>/dev/null || true
+    fi
+    usermod -aG letsencrypt "$MAIL_USER" 2>/dev/null || true
+
+    # Allow group traversal of Let's Encrypt directories
+    chmod 750 /etc/letsencrypt/live/ 2>/dev/null || true
+    chmod 750 /etc/letsencrypt/archive/ 2>/dev/null || true
+    chgrp letsencrypt /etc/letsencrypt/live/ 2>/dev/null || true
+    chgrp letsencrypt /etc/letsencrypt/archive/ 2>/dev/null || true
+
+    # Set up post-renewal hook to restart fula-mail (picks up new cert)
+    local renewal_hook_dir="/etc/letsencrypt/renewal-hooks/post"
+    mkdir -p "$renewal_hook_dir"
+    cat > "${renewal_hook_dir}/fula-mail-restart.sh" <<'HOOKEOF'
+#!/bin/bash
+# Restart fula-mail after certbot renewal so SMTP STARTTLS uses the new cert.
+systemctl restart fula-mail 2>/dev/null || true
+# Nginx is restarted by certbot automatically.
+HOOKEOF
+    chmod +x "${renewal_hook_dir}/fula-mail-restart.sh"
+
+    # Restart fula-mail so it picks up the new TLS paths
+    if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        log "Restarting ${SERVICE_NAME} to enable SMTP STARTTLS..."
+        systemctl restart "${SERVICE_NAME}" || log_warn "Failed to restart service after TLS setup"
+    fi
+
+    log "SSL setup complete — HTTPS and SMTP STARTTLS enabled"
+}
+
+# ============================================
 # Start service
 # ============================================
 start_service() {
@@ -863,11 +1156,39 @@ print_status() {
         echo -e "  Health:   ${RED}unreachable${NC}"
     fi
 
+    # Nginx
+    if [ -f "$NGINX_SITE_FILE" ] && nginx -t 2>/dev/null; then
+        echo -e "  Nginx:    ${GREEN}configured${NC}"
+    elif command -v nginx &>/dev/null; then
+        echo -e "  Nginx:    ${YELLOW}installed but not configured for fula-mail${NC}"
+    else
+        echo -e "  Nginx:    ${RED}not installed${NC}"
+    fi
+
+    # TLS
+    if [ -f "$ENV_FILE" ]; then
+        local cert_path="${TLS_CERT_PATH:-}"
+        if [ -n "$cert_path" ] && [ -f "$cert_path" ]; then
+            local expiry
+            expiry=$(openssl x509 -in "$cert_path" -noout -enddate 2>/dev/null \
+                | sed 's/notAfter=//' || echo "unknown")
+            echo -e "  TLS:      ${GREEN}enabled${NC} (expires: ${expiry})"
+        else
+            echo -e "  TLS:      ${YELLOW}not configured${NC}"
+        fi
+    fi
+
     # Ports
     echo ""
     echo "  Ports:"
-    echo "    HTTP API: ${MAIL_HTTP_PORT:-$DEFAULT_HTTP_PORT}"
-    echo "    SMTP:     ${MAIL_SMTP_PORT:-$DEFAULT_SMTP_PORT}"
+    echo "    HTTP API:   ${MAIL_HTTP_PORT:-$DEFAULT_HTTP_PORT} (internal)"
+    if [ -f "$NGINX_SITE_FILE" ]; then
+        echo "    HTTP/nginx: 80 → ${MAIL_HTTP_PORT:-$DEFAULT_HTTP_PORT}"
+        if grep -q "listen 443" "$NGINX_SITE_FILE" 2>/dev/null; then
+            echo "    HTTPS:      443 (certbot)"
+        fi
+    fi
+    echo "    SMTP:       ${MAIL_SMTP_PORT:-$DEFAULT_SMTP_PORT}"
     echo ""
 }
 
@@ -881,9 +1202,11 @@ do_uninstall() {
     echo "  - Stop and disable the fula-mail service"
     echo "  - Remove the binary and configuration"
     echo "  - Remove the systemd service file"
+    echo "  - Remove the nginx site config (nginx itself is kept)"
     echo ""
-    echo -e "${YELLOW}Database tables will NOT be removed.${NC}"
+    echo -e "${YELLOW}Database tables and SSL certs will NOT be removed.${NC}"
     echo "To drop mail tables, do so manually in psql."
+    echo "To revoke certs: sudo certbot delete --cert-name <domain>"
     echo ""
     read -rp "Continue? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -900,6 +1223,16 @@ do_uninstall() {
     fi
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
+
+    # Remove nginx site config
+    if [ -f "$NGINX_SITE_FILE" ] || [ -L "$NGINX_SITE_LINK" ]; then
+        rm -f "$NGINX_SITE_LINK" "$NGINX_SITE_FILE"
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+        log "Nginx site config removed"
+    fi
+
+    # Remove certbot renewal hook
+    rm -f /etc/letsencrypt/renewal-hooks/post/fula-mail-restart.sh 2>/dev/null || true
 
     # Remove install dir but preserve .env as backup
     if [ -f "$ENV_FILE" ]; then
@@ -937,9 +1270,25 @@ print_summary() {
     echo "  Log file:     ${LOG_FILE}"
     echo "  Service:      ${SERVICE_NAME}"
     echo ""
-    echo "  HTTP API:     http://${CFG_MX_HOSTNAME}:${CFG_MAIL_HTTP_PORT}"
+    if [ -n "$CFG_TLS_CERT_PATH" ]; then
+        echo "  HTTPS API:    https://${CFG_MX_HOSTNAME}"
+    else
+        echo "  HTTP API:     http://${CFG_MX_HOSTNAME}:${CFG_MAIL_HTTP_PORT}"
+    fi
     echo "  SMTP inbound: ${CFG_MX_HOSTNAME}:${CFG_MAIL_SMTP_PORT}"
+    if [ -n "$CFG_TLS_CERT_PATH" ]; then
+        echo "  STARTTLS:     enabled"
+    fi
     echo ""
+
+    if [ "${CFG_SETUP_NGINX}" = "yes" ]; then
+        echo "  Nginx:        port 80 → ${CFG_MAIL_HTTP_PORT}"
+        if [ -n "$CFG_TLS_CERT_PATH" ]; then
+            echo "                port 443 (TLS) → ${CFG_MAIL_HTTP_PORT}"
+        fi
+        echo ""
+    fi
+
     echo "  Useful commands:"
     echo "    sudo systemctl status ${SERVICE_NAME}"
     echo "    sudo journalctl -u ${SERVICE_NAME} -f"
@@ -948,7 +1297,11 @@ print_summary() {
 
     if [ -z "$CFG_TLS_CERT_PATH" ]; then
         echo -e "${YELLOW}  Note: TLS is not configured. SMTP STARTTLS and HTTPS are disabled.${NC}"
-        echo -e "${YELLOW}  Set TLS_CERT_PATH and TLS_KEY_PATH in ${ENV_FILE} to enable.${NC}"
+        if [ "${CFG_SETUP_CERTBOT}" != "yes" ]; then
+            echo -e "${YELLOW}  Re-run install.sh and choose certbot, or set TLS paths in ${ENV_FILE}${NC}"
+        else
+            echo -e "${YELLOW}  Certbot may have failed — check log and re-run install.sh${NC}"
+        fi
         echo ""
     fi
 }
@@ -1033,6 +1386,12 @@ main() {
 
     # Phase 12: Start service and health check
     start_service
+
+    # Phase 13: Nginx reverse proxy (HTTP only initially)
+    setup_nginx
+
+    # Phase 14: Certbot SSL (adds 443 to nginx, sets TLS paths for SMTP STARTTLS)
+    setup_certbot
 
     # Clean up temp
     rm -rf "$TEMP_DIR" 2>/dev/null || true
