@@ -15,6 +15,12 @@ pub enum MailError {
     #[error("Address already exists: {0}")]
     AddressExists(String),
 
+    #[error("Tag not found: {0}")]
+    TagNotFound(String),
+
+    #[error("Tag already exists: {0}")]
+    TagExists(String),
+
     #[error("Invalid peer ID: {0}")]
     InvalidPeerId(String),
 
@@ -71,6 +77,11 @@ impl IntoResponse for MailError {
                 tracing::warn!("Queue entry not found: {}", q);
                 (StatusCode::NOT_FOUND, "Not found".to_string())
             }
+            MailError::TagNotFound(t) => {
+                tracing::warn!("Tag not found: {}", t);
+                (StatusCode::NOT_FOUND, "Not found".to_string())
+            }
+            MailError::TagExists(_) => (StatusCode::CONFLICT, "Tag already exists".to_string()),
             MailError::DomainNotVerified(_) => (StatusCode::PRECONDITION_FAILED, "Domain not verified".to_string()),
             MailError::AddressExists(_) => (StatusCode::CONFLICT, "Address already exists".to_string()),
             MailError::InvalidPeerId(_) => (StatusCode::BAD_REQUEST, "Invalid peer ID".to_string()),

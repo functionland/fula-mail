@@ -46,12 +46,17 @@ pub async fn enqueue_outbound(
         address_id,
         &req.from,
         &req.to,
+        &req.cc,
+        &req.bcc,
         &req.subject,
         &req.body,
         content_type,
     ).await?;
 
-    tracing::info!("Enqueued outbound mail {} -> {:?} (queue_id={})", req.from, req.to, queue_id);
+    tracing::info!(
+        "Enqueued outbound mail {} -> to={:?} cc={:?} bcc={:?} (queue_id={})",
+        req.from, req.to, req.cc, req.bcc, queue_id
+    );
     Ok(queue_id)
 }
 
@@ -139,13 +144,17 @@ async fn deliver_one(
     // H8: Decrypt body (encrypted at rest in outbound queue)
     let body = db.decrypt_outbound_body(&entry.body)?;
 
-    // Build the email message
+    // Build the email message: To + Cc go into both headers and envelope.
+    // Bcc goes into the envelope only (so recipients don't see each other).
     let mut email_builder = Message::builder()
         .from(entry.sender.parse()?)
         .subject(&entry.subject);
 
     for to in &entry.recipients {
         email_builder = email_builder.to(to.parse()?);
+    }
+    for cc in &entry.cc {
+        email_builder = email_builder.cc(cc.parse()?);
     }
 
     let mut email = if entry.content_type.contains("html") {
@@ -169,12 +178,24 @@ async fn deliver_one(
         tracing::warn!("Failed to load DKIM key for domain {}, sending unsigned", addr.domain);
     }
 
+    // Build explicit envelope so Bcc addresses are delivered via RCPT TO
+    // without leaking into message headers.
+    let mut envelope_addrs: Vec<lettre::Address> = Vec::new();
+    for r in entry.recipients.iter().chain(entry.cc.iter()).chain(entry.bcc.iter()) {
+        envelope_addrs.push(r.parse::<lettre::Address>()?);
+    }
+    let envelope = lettre::address::Envelope::new(
+        Some(entry.sender.parse::<lettre::Address>()?),
+        envelope_addrs,
+    )?;
+    let email_bytes = email.formatted();
+
     // Resolve relay: per-user BYOK first, then global fallback
     let relay = addr.relay_config()
         .or_else(|| global_relay_config(config));
 
     match relay {
-        Some(relay_config) => relay_via_provider(&relay_config, &email).await,
+        Some(relay_config) => relay_via_provider(&relay_config, &envelope, &email_bytes).await,
         None => anyhow::bail!(
             "No outbound relay configured for {} (permanent)", entry.sender
         ),
@@ -210,44 +231,42 @@ fn global_relay_config(config: &Config) -> Option<RelayConfig> {
     })
 }
 
-/// Relay message via the user's provider.
-async fn relay_via_provider(relay: &RelayConfig, email: &Message) -> Result<String> {
+/// Relay message via the user's provider using an explicit envelope so Bcc
+/// recipients are delivered (RCPT TO) without appearing in message headers.
+async fn relay_via_provider(
+    relay: &RelayConfig,
+    envelope: &lettre::address::Envelope,
+    email_bytes: &[u8],
+) -> Result<String> {
     match relay {
         RelayConfig::SendGrid { api_key } => {
-            relay_sendgrid(api_key, email).await
+            relay_smtp("smtp.sendgrid.net", 587, "apikey", api_key, envelope, email_bytes).await
         }
-        RelayConfig::Mailgun { api_key, domain } => {
-            relay_mailgun(api_key, domain, email).await
+        RelayConfig::Mailgun { api_key, domain: _ } => {
+            relay_smtp("smtp.mailgun.org", 587, "api", api_key, envelope, email_bytes).await
         }
         RelayConfig::Smtp { host, port, username, password } => {
-            relay_smtp(host, *port, username, password, email).await
+            relay_smtp(host, *port, username, password, envelope, email_bytes).await
         }
     }
 }
 
-/// Send via SendGrid SMTP relay (C2 fix).
-///
-/// Uses SendGrid's SMTP endpoint instead of the Web API. This correctly sends
-/// the full DKIM-signed MIME message rather than constructing a separate payload
-/// that would discard the DKIM signature and message body.
-async fn relay_sendgrid(api_key: &str, email: &Message) -> Result<String> {
-    // SendGrid SMTP: authenticate with "apikey" as username and the API key as password
-    relay_smtp("smtp.sendgrid.net", 587, "apikey", api_key, email).await
-}
-
-/// Send via Mailgun SMTP relay.
-async fn relay_mailgun(api_key: &str, _domain: &str, email: &Message) -> Result<String> {
-    relay_smtp("smtp.mailgun.org", 587, "api", api_key, email).await
-}
-
-/// Send via generic SMTP relay (works for any provider: SES, Postmark, self-hosted, etc.).
-async fn relay_smtp(host: &str, port: u16, username: &str, password: &str, email: &Message) -> Result<String> {
+/// Send via generic SMTP relay. Uses send_raw so the caller controls the
+/// envelope explicitly (Bcc addresses go in RCPT TO but not in the body).
+async fn relay_smtp(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    envelope: &lettre::address::Envelope,
+    email_bytes: &[u8],
+) -> Result<String> {
     let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?
         .port(port)
         .credentials(Credentials::new(username.to_string(), password.to_string()))
         .build();
 
-    let response = transport.send(email.clone()).await?;
+    let response = transport.send_raw(envelope, email_bytes).await?;
     let message_id = response.message().collect::<Vec<_>>().join(" ");
 
     Ok(message_id)

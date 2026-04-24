@@ -466,6 +466,8 @@ impl Database {
         address_id: Uuid,
         sender: &str,
         recipients: &[String],
+        cc: &[String],
+        bcc: &[String],
         subject: &str,
         body: &str,
         content_type: &str,
@@ -474,13 +476,15 @@ impl Database {
         let encrypted_body = self.encrypt(body)?;
 
         let id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO mail_outbound_queue (address_id, sender, recipients, subject, body, content_type)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO mail_outbound_queue (address_id, sender, recipients, cc, bcc, subject, body, content_type)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id"
         )
         .bind(address_id)
         .bind(sender)
         .bind(recipients)
+        .bind(cc)
+        .bind(bcc)
         .bind(subject)
         .bind(&encrypted_body)
         .bind(content_type)
@@ -508,7 +512,7 @@ impl Database {
                  LIMIT $1
                  FOR UPDATE SKIP LOCKED
              )
-             RETURNING id, address_id, sender, recipients, subject, body, content_type, retry_count"
+             RETURNING id, address_id, sender, recipients, cc, bcc, subject, body, content_type, retry_count"
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -562,6 +566,74 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    // ---- Tags ----
+
+    pub async fn list_tags(&self, owner_peer_id: &str) -> Result<Vec<TagRecord>> {
+        let records = sqlx::query_as::<_, TagRecord>(
+            "SELECT id, name, color_argb, created_at
+             FROM mail_tags
+             WHERE owner_peer_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(owner_peer_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(records)
+    }
+
+    pub async fn create_tag(
+        &self,
+        owner_peer_id: &str,
+        name: &str,
+        color_argb: i64,
+    ) -> Result<TagRecord> {
+        let record = sqlx::query_as::<_, TagRecord>(
+            "INSERT INTO mail_tags (owner_peer_id, name, color_argb)
+             VALUES ($1, $2, $3)
+             RETURNING id, name, color_argb, created_at",
+        )
+        .bind(owner_peer_id)
+        .bind(name)
+        .bind(color_argb)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Returns true when a row was actually updated (respecting ownership).
+    pub async fn update_tag(
+        &self,
+        owner_peer_id: &str,
+        id: Uuid,
+        name: Option<&str>,
+        color_argb: Option<i64>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE mail_tags
+             SET name       = COALESCE($3, name),
+                 color_argb = COALESCE($4, color_argb)
+             WHERE id = $1 AND owner_peer_id = $2",
+        )
+        .bind(id)
+        .bind(owner_peer_id)
+        .bind(name)
+        .bind(color_argb)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_tag(&self, owner_peer_id: &str, id: Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM mail_tags WHERE id = $1 AND owner_peer_id = $2",
+        )
+        .bind(id)
+        .bind(owner_peer_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     // ---- Queue cleanup (H9) ----
@@ -808,12 +880,24 @@ pub struct AddressOwnerRecord {
     pub owner_peer_id: String,
 }
 
+#[derive(sqlx::FromRow, Debug, serde::Serialize)]
+pub struct TagRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub color_argb: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(sqlx::FromRow, Debug)]
 pub struct OutboundQueueRecord {
     pub id: Uuid,
     pub address_id: Uuid,
     pub sender: String,
     pub recipients: Vec<String>,
+    #[sqlx(default)]
+    pub cc: Vec<String>,
+    #[sqlx(default)]
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
     pub content_type: String,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Router,
 };
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor};
@@ -62,6 +62,10 @@ pub async fn run_http(state: Arc<AppState>) -> anyhow::Result<()> {
 
         // Push notification token registration
         .route("/api/v1/push-token", put(handlers::register_push_token))
+
+        // Tags (user-defined labels; definitions on server, assignments encrypted client-side)
+        .route("/api/v1/tags", get(handlers::list_tags).post(handlers::create_tag))
+        .route("/api/v1/tags/{id}", patch(handlers::update_tag).delete(handlers::delete_tag))
 
         // Relay config (BYOK: user provides their own SendGrid/Mailgun/SMTP credentials)
         .route("/api/v1/relay", post(handlers::set_relay_config))

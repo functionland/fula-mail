@@ -361,6 +361,149 @@ pub async fn register_push_token(
     Ok(StatusCode::OK)
 }
 
+// ---- Tags ----
+
+#[derive(Deserialize)]
+pub struct CreateTagRequest {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTagRequest {
+    pub name: Option<String>,
+    pub color: Option<i64>,
+}
+
+const DEFAULT_TAG_COLOR: i64 = 0xFF9E9E9E; // grey
+
+pub async fn list_tags(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<serde_json::Value>, MailError> {
+    let tags = state
+        .db
+        .list_tags(&user.peer_id)
+        .await
+        .map_err(MailError::Internal)?;
+
+    let items: Vec<serde_json::Value> = tags
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "name": t.name,
+                "color": t.color_argb,
+                "created_at": t.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "tags": items })))
+}
+
+pub async fn create_tag(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<CreateTagRequest>,
+) -> Result<Json<serde_json::Value>, MailError> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(MailError::InvalidInput(
+            "Tag name cannot be empty".to_string(),
+        ));
+    }
+    if name.len() > 64 {
+        return Err(MailError::InvalidInput(
+            "Tag name must be at most 64 characters".to_string(),
+        ));
+    }
+
+    let color = req.color.unwrap_or(DEFAULT_TAG_COLOR);
+    let created = state
+        .db
+        .create_tag(&user.peer_id, &name, color)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("unique") || msg.contains("duplicate") {
+                MailError::TagExists(name.clone())
+            } else {
+                MailError::Internal(e)
+            }
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "id": created.id,
+        "name": created.name,
+        "color": created.color_argb,
+        "created_at": created.created_at,
+    })))
+}
+
+pub async fn update_tag(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateTagRequest>,
+) -> Result<StatusCode, MailError> {
+    let trimmed_name = req.name.as_ref().map(|n| n.trim().to_string());
+    if let Some(ref n) = trimmed_name {
+        if n.is_empty() {
+            return Err(MailError::InvalidInput(
+                "Tag name cannot be empty".to_string(),
+            ));
+        }
+        if n.len() > 64 {
+            return Err(MailError::InvalidInput(
+                "Tag name must be at most 64 characters".to_string(),
+            ));
+        }
+    }
+
+    let updated = state
+        .db
+        .update_tag(
+            &user.peer_id,
+            id,
+            trimmed_name.as_deref(),
+            req.color,
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("unique") || msg.contains("duplicate") {
+                MailError::TagExists(
+                    trimmed_name.clone().unwrap_or_else(|| id.to_string()),
+                )
+            } else {
+                MailError::Internal(e)
+            }
+        })?;
+
+    if !updated {
+        return Err(MailError::TagNotFound(id.to_string()));
+    }
+    Ok(StatusCode::OK)
+}
+
+pub async fn delete_tag(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, MailError> {
+    let deleted = state
+        .db
+        .delete_tag(&user.peer_id, id)
+        .await
+        .map_err(MailError::Internal)?;
+    if !deleted {
+        return Err(MailError::TagNotFound(id.to_string()));
+    }
+    Ok(StatusCode::OK)
+}
+
 // ---- Relay config (BYOK: SendGrid, Mailgun, SMTP) ----
 
 pub async fn set_relay_config(
@@ -441,6 +584,10 @@ pub struct SetRelayConfigRequest {
 pub struct OutboundRequest {
     pub from: String,
     pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
     pub content_type: Option<String>,
@@ -456,6 +603,12 @@ pub async fn submit_outbound(
         return Err(MailError::InvalidInput("At least one recipient is required".to_string()));
     }
     for recipient in &req.to {
+        validate_email_address(recipient)?;
+    }
+    for recipient in &req.cc {
+        validate_email_address(recipient)?;
+    }
+    for recipient in &req.bcc {
         validate_email_address(recipient)?;
     }
     validate_email_address(&req.from)?;

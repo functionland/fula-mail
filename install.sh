@@ -521,6 +521,8 @@ run_migrations() {
         "${SCRIPT_DIR}/migrations/postgres/002_relay_config.sql"
         "${SCRIPT_DIR}/migrations/postgres/003_hardening.sql"
         "${SCRIPT_DIR}/migrations/postgres/004_outbound_queue.sql"
+        "${SCRIPT_DIR}/migrations/postgres/005_cc_bcc.sql"
+        "${SCRIPT_DIR}/migrations/postgres/006_tags.sql"
     )
 
     # Verify all migration files exist before starting
